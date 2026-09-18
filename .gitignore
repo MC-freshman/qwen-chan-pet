@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+out/
+qwen.jpg
+qwen2.jpeg
+app/save.json
+app/config.local.json
+app/run/
