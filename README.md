@@ -79,4 +79,4 @@ poses/*.png  →  build_qwen_spritesheet.py  →  out/spritesheet.webp  →  app
 
 ## 版权
 
-形象基于通义千问官方吉祥物二创，仅供个人学习与本地使用；原始参考立绘未纳入本仓库。
+形象基于通义千问非官方吉祥物二创，最先由B站up主生成，仅供个人学习与本地使用；原始参考立绘未纳入本仓库。
