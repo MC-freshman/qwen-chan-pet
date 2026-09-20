@@ -59,10 +59,19 @@ def band_scale(image: Image.Image, top: float, bottom: float, factor: float) -> 
     return Image.fromarray(_alpha_composite_zero(out), "RGBA")
 
 
-def simple_pendulum(height: int, pivot: float, amp: float) -> np.ndarray:
-    """Same-sign lean above and below the pivot, like swaying on a string."""
+def simple_pendulum(height: int, pivot: float, amp: float, rigid_above: float | None = None) -> np.ndarray:
+    """Same-sign lean above and below the pivot, like swaying on a string.
+
+    rigid_above freezes every row above that line at the neck's own offset: without
+    it the head gets the largest displacement in the sprite and the gradient inside
+    the head smears the hat brim into a streak.
+    """
     ys = np.arange(height, dtype=float)
-    return amp * np.clip(np.abs(ys - pivot) / max(1.0, max(pivot, height - pivot)), 0, 1)
+    reach = np.clip(np.abs(ys - pivot) / max(1.0, max(pivot, height - pivot)), 0, 1)
+    if rigid_above is not None:
+        cap = np.clip(abs(rigid_above - pivot) / max(1.0, max(pivot, height - pivot)), 0, 1)
+        reach = np.minimum(reach, cap)
+    return amp * reach
 
 
 def head_follow_profile(height: int, head_bottom: float, amp: float, shoulder: float = 14.0) -> np.ndarray:

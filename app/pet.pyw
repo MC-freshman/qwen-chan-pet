@@ -220,6 +220,8 @@ class Pet:
         self.head: dict[str, tuple[float, float]] = {}
         self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
         self.sheet = None if FRAMES_DIR.is_dir() else Image.open(SHEET).convert("RGBA")
+        rig_file = FRAMES_DIR / "rig.json"
+        self.chin = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
 
     def prepare(self, image: Image.Image) -> Image.Image:
         cell = image.resize(self.frame_size, Image.Resampling.LANCZOS)
@@ -273,8 +275,11 @@ class Pet:
         cell = cells[index % len(cells)]
         if gaze:
             hx, hy = self.head[state]
+            # Ramp from the chin down: the hat sits in the rigid zone above it, so a
+            # misread face line cannot streak the brim the way a 14px neck band did.
+            chin = (self.chin.get(state) or {}).get("chin") or hy + cell.height * 0.24
             cell = rigor.shear_rows(
-                cell, rigor.head_follow_profile(cell.height, hy + cell.height * 0.1, gaze * 2.2)
+                cell, rigor.head_follow_profile(cell.height, chin, gaze * 2.2, shoulder=26.0)
             )
             cell.putalpha(cell.getchannel("A").point(lambda v: 255 if v >= 128 else 0))
         flat = Image.new("RGB", cell.size, (255, 0, 254))

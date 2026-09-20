@@ -37,6 +37,7 @@ CALM = {"idle", "waiting", "review", "failed"}
 HEAD_SECTOR = (-140.0, -40.0)   # image y grows down, so "up" is -90
 SKIRT_SECTOR = (40.0, 140.0)
 HIP_FRACTION = 0.66  # sway pivot, measured down the sprite
+NECK_FRACTION = 0.30  # rows above this stay rigid, so the hat never smears
 EYE_BAND = (0.155, 0.215)  # eyes sit here within the art height on a chibi
 BLINK_WINDOW = 0.09
 
@@ -83,6 +84,50 @@ def spring_series(state: str, count: int) -> tuple[list, list]:
             else:
                 sh.step(ht, dt); ss.step(st, dt)
     return head, skirt
+
+
+def face_lines(content: Image.Image) -> dict:
+    """Locate the eyes as the only row band with two separated dark clusters.
+
+    Fraction-of-art-height guesses land on the hat, which is what smeared the brim.
+    """
+    import numpy as np
+
+    arr = np.array(content.convert("RGB")).astype(int)
+    alpha = np.array(content.getchannel("A"))
+    alpha[:44, :76] = 0
+    ys, _ = np.nonzero(alpha)
+    if len(ys) == 0:
+        return {"eye": content.height * 0.2, "chin": content.height * 0.3}
+    top, bottom = int(ys.min()), int(ys.max())
+    height = max(1, bottom - top)
+    dark = (arr.sum(axis=2) < 340) & (alpha > 128)
+    best = None
+    for y in range(top + int(height * 0.12), top + int(height * 0.42)):
+        cols = np.flatnonzero(dark[y])
+        if len(cols) < 8:
+            continue
+        gaps = np.flatnonzero(np.diff(cols) > 6)
+        if len(gaps) < 1:
+            continue
+        left, right = cols[: gaps[0] + 1], cols[gaps[-1] + 1 :]
+        if len(left) < 3 or len(right) < 3:
+            continue
+        spread = int(right.mean() - left.mean())
+        if not 12 <= spread <= int(content.width * 0.7):
+            continue
+        # 真眼睛关于脸的中轴大致对称、两大小相近；帽子的花饰不满足
+        centre = int(alpha[y].nonzero()[0].mean()) if alpha[y].any() else content.width // 2
+        if abs((left.mean() + right.mean()) / 2 - centre) > content.width * 0.16:
+            continue
+        if min(len(left), len(right)) / max(len(left), len(right)) < 0.45:
+            continue
+        if best is None or (y - top) < best[0]:
+            best = (y - top, y)
+    if best is None:
+        return {"eye": None, "chin": None}          # 不确定就不做眨眼，别压坏帽子
+    eye = top + best[0]
+    return {"eye": eye, "chin": eye + max(6, int(height * 0.09))}
 
 
 def motion_at(state: str, index: int, count: int) -> tuple[float, float, float, float]:
@@ -149,7 +194,11 @@ def animate(state: str, index: int, count: int, sprite: Image.Image,
     amp = -velocity_x * 1.9 - velocity_y * 0.5
     if abs(amp) > 0.15:
         content = rigor.shear_rows(
-            content, rigor.simple_pendulum(content.height, top + height * HIP_FRACTION, amp)
+            content,
+            rigor.simple_pendulum(
+                content.height, top + height * HIP_FRACTION, amp,
+                rigid_above=top + height * NECK_FRACTION,
+            ),
         )
 
     # Real joints: the head counter-rotates to hold the gaze while the skirt trails.
@@ -175,9 +224,10 @@ def animate(state: str, index: int, count: int, sprite: Image.Image,
     if count >= 12:
         offset = abs(math.sin(2 * math.pi * (phase + 0.37 * (index % 3))))
         if offset < BLINK_WINDOW:
-            content = rigor.band_scale(
-                content, top + height * EYE_BAND[0], top + height * EYE_BAND[1], 0.32
-            )
+            lines = face_lines(content)
+            if lines["eye"] is not None:
+                # 宽带 + 轻压：定位偏几行也只是柔和平移，不会拉出硬拖影
+                content = rigor.band_scale(content, lines["eye"] - 6, lines["eye"] + 8, 0.55)
     return place(content, dx, dy, state)
 
 
@@ -185,6 +235,7 @@ def main() -> None:
     OUT_SHEET.parent.mkdir(exist_ok=True)
     (ROOT / "out" / "preview.png").parent.mkdir(exist_ok=True)
     sheet = Image.new("RGBA", (CELL_W * base.COLS, CELL_H * base.ROWS), (0, 0, 0, 0))
+    rig_map = {}
     for row, state in enumerate(base.ROW_STATES if hasattr(base, "ROW_STATES") else [s for s, _ in base.STATES]):
         count = FRAMES[state]
         sprite = base.trim(base.cutout(base.find_source(base.POSES[state])))
@@ -201,11 +252,17 @@ def main() -> None:
             frame = base.clear_hidden_rgb(animate(state, index, count, sprite, springs))
             frame.save(folder / f"{index:02d}.png")
             frames.append(frame)
+        rig_map[state] = face_lines(Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA"))
         keep = min(base.COLS, count)
         picks = [frames[round(k * (count - 1) / (keep - 1))] for k in range(keep)] if keep > 1 else frames
         for col, frame in enumerate(picks):
             sheet.alpha_composite(frame, (col * CELL_W, row * CELL_H))
         print(f"{state:14s} {count} frames -> sheet row {row} keeps {len(picks)}")
+    import json
+    (OUT_FRAMES / "rig.json").write_text(json.dumps(rig_map, ensure_ascii=False, indent=2), encoding="utf-8")
+    for state, lines in rig_map.items():
+        eye = lines["eye"]
+        print(f"  {state:14s} eye={int(eye) if eye else None} chin={int(lines['chin']) if lines['chin'] else None}")
     sheet.save(OUT_SHEET, lossless=True)
     sheet.save(ROOT / "out" / "spritesheet.png")
     base.preview(ROOT / "out" / "preview.png")

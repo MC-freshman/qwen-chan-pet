@@ -1,0 +1,38 @@
+{
+  "idle": {
+    "eye": 85,
+    "chin": 98
+  },
+  "running-right": {
+    "eye": 99,
+    "chin": 111
+  },
+  "running-left": {
+    "eye": 99,
+    "chin": 111
+  },
+  "waving": {
+    "eye": 85,
+    "chin": 98
+  },
+  "jumping": {
+    "eye": 92,
+    "chin": 103
+  },
+  "failed": {
+    "eye": 61,
+    "chin": 75
+  },
+  "waiting": {
+    "eye": null,
+    "chin": null
+  },
+  "running": {
+    "eye": 67,
+    "chin": 80
+  },
+  "review": {
+    "eye": 64,
+    "chin": 77
+  }
+}
