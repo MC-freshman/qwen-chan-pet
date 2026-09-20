@@ -226,13 +226,12 @@ class Pet:
     def prepare(self, image: Image.Image) -> Image.Image:
         cell = image.resize(self.frame_size, Image.Resampling.LANCZOS)
         # The sheet's charm hangs from the cell top, which has no ceiling here;
-        # it now dangles from the speech bubble instead.
-        alpha = cell.getchannel("A")
-        ImageDraw.Draw(alpha).rectangle(
-            [0, 0, round(cell.width * 0.32), round(cell.height * 0.16)], fill=0
-        )
+        # it now dangles from the speech bubble instead. Drop it by detachment, not
+        # by a fixed box: it swings and droops per state, so a box either leaves a
+        # sliver on the "failed" row or clips her hat.
+        cell = rigor.drop_detached(cell, round(cell.height * 0.24), round(cell.width * 0.38))
         # A key-colour window cannot blend, so harden the silhouette edge.
-        cell.putalpha(alpha.point(lambda v: 255 if v >= 128 else 0))
+        cell.putalpha(cell.getchannel("A").point(lambda v: 255 if v >= 128 else 0))
         return cell
 
     def load_state(self, state: str) -> list[Image.Image]:

@@ -141,3 +141,41 @@ class Spring:
         self.v += (self.k * (target - self.x) - self.c * self.v) * dt
         self.x += self.v * dt
         return self.x
+
+
+def drop_detached(image: Image.Image, limit_row: int, limit_col: int) -> Image.Image:
+    """Erase alpha blobs that sit entirely inside the top-left corner.
+
+    The sheet's charm hangs from the cell ceiling, which a free-floating window has
+    no use for, but it swings and droops by state, so a fixed box either leaves a
+    sliver behind or eats into the hat. Detachment is the reliable signal: anything
+    connected to her body survives, an isolated corner ornament goes.
+    """
+    from collections import deque
+
+    arr = np.array(image.convert("RGBA"))
+    alpha = arr[:, :, 3] > 0
+    seen = np.zeros(alpha.shape, dtype=bool)
+    height, width = alpha.shape
+    removed = 0
+    for sy in range(min(limit_row, height)):
+        for sx in range(min(limit_col, width)):
+            if not alpha[sy, sx] or seen[sy, sx]:
+                continue
+            queue = deque([(sy, sx)])
+            seen[sy, sx] = True
+            blob = [(sy, sx)]
+            while queue:
+                y, x = queue.popleft()
+                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
+                    if 0 <= ny < height and 0 <= nx < width and alpha[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        queue.append((ny, nx))
+                        blob.append((ny, nx))
+            if max(b[0] for b in blob) < limit_row and max(b[1] for b in blob) < limit_col:
+                for y, x in blob:
+                    alpha[y, x] = False
+                removed += len(blob)
+    arr[:, :, 3] = np.where(alpha, 255, 0).astype(np.uint8)
+    arr[arr[:, :, 3] == 0, :3] = 0
+    return Image.fromarray(arr, "RGBA")

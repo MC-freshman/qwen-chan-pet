@@ -1,38 +1,38 @@
 {
   "idle": {
-    "eye": 85,
-    "chin": 98
+    "eye": 54,
+    "chin": 69
   },
   "running-right": {
-    "eye": 99,
-    "chin": 111
+    "eye": 60,
+    "chin": 73
   },
   "running-left": {
-    "eye": 99,
-    "chin": 111
+    "eye": 62,
+    "chin": 75
   },
   "waving": {
-    "eye": 85,
-    "chin": 98
+    "eye": null,
+    "chin": null
   },
   "jumping": {
-    "eye": 92,
-    "chin": 103
+    "eye": 87,
+    "chin": 98
   },
   "failed": {
-    "eye": 61,
-    "chin": 75
+    "eye": 59,
+    "chin": 74
   },
   "waiting": {
     "eye": null,
     "chin": null
   },
   "running": {
-    "eye": 67,
-    "chin": 80
+    "eye": 62,
+    "chin": 75
   },
   "review": {
-    "eye": 64,
-    "chin": 77
+    "eye": null,
+    "chin": null
   }
 }

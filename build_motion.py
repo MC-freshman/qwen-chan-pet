@@ -158,23 +158,48 @@ def art_span(content: Image.Image) -> tuple[int, int]:
     return box[1], box[3]
 
 
-def fit_state(state: str, count: int, sprite: Image.Image) -> Image.Image:
-    """base.fit_state indexes the sparse keyframes, so re-derive the fit from the dense ones."""
+def render_state(state: str, count: int, sprite: Image.Image, height: int):
+    scaled = base.fit(sprite, height)
+    springs = spring_series(state, count)
+    return scaled, [animate(state, index, count, scaled, springs) for index in range(count)]
+
+
+def art_box(frame: Image.Image) -> tuple[int, int, int, int]:
+    """Her bounding box alone; the ceiling charm may legitimately touch y = 0."""
+    import numpy as np
+
+    alpha = np.array(frame.getchannel("A"))
+    alpha[:44, :76] = 0
+    ys, xs = np.nonzero(alpha)
+    if len(ys) == 0:
+        return (0, 0, 0, 0)
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def fit_state(state: str, count: int, sprite: Image.Image):
+    """Shrink until the *finished* frames fit the safe box.
+
+    The previous estimate looked only at the pre-deformation sprite, so the pendulum,
+    joint twist and blink could still push the silhouette past the cell edge - that is
+    why the raised fan kept getting cut while jumping.
+    """
     height = base.FIT[state][0]
-    for _ in range(12):
-        scaled = base.fit(sprite, height)
-        need_h = need_w = 0
-        for index in range(count):
-            dx, dy, tilt, squash = motion_at(state, index, count)
-            body = base.transform(scaled, dx, dy, tilt, squash)
-            box = body.getchannel("A").getbbox()
-            cw, ch = body.crop(box).size
-            need_h = max(need_h, ch - min(dy, 0))
-            need_w = max(need_w, cw + 2 * abs(dx + base.FIT[state][1]))
-        if need_h <= CELL_H - base.BASELINE - base.SAFE_TOP and need_w <= CELL_W - base.SAFE_SIDE * 2:
-            return scaled
-        height = int(height * 0.96)
-    return base.fit(sprite, height)
+    scaled, frames = render_state(state, count, sprite, height)
+    box = (0, 0, 0, 0)
+    for _ in range(5):
+        boxes = [art_box(frame) for frame in frames]
+        left = min(b[0] for b in boxes)
+        top = min(b[1] for b in boxes)
+        right = max(b[2] for b in boxes)
+        bottom = max(b[3] for b in boxes)
+        box = (left, top, right, bottom)
+        need = max(base.SAFE_SIDE - left, right - (CELL_W - base.SAFE_SIDE), base.SAFE_TOP - top)
+        if need <= 0:
+            break
+        span = max(1.0, bottom - top)
+        height = max(110, int(height * max(0.80, 1.0 - need / span) * 0.97))
+        scaled, frames = render_state(state, count, sprite, height)
+    return scaled, frames, box
 
 
 def animate(state: str, index: int, count: int, sprite: Image.Image,
@@ -241,23 +266,20 @@ def main() -> None:
         sprite = base.trim(base.cutout(base.find_source(base.POSES[state])))
         if state in base.MIRROR:
             sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        sprite = fit_state(state, count, sprite)
-        springs = spring_series(state, count)
+        sprite, frames, box = fit_state(state, count, sprite)
         folder = OUT_FRAMES / state
         folder.mkdir(parents=True, exist_ok=True)
         for old in folder.glob("*.png"):
             old.unlink()
-        frames = []
-        for index in range(count):
-            frame = base.clear_hidden_rgb(animate(state, index, count, sprite, springs))
-            frame.save(folder / f"{index:02d}.png")
-            frames.append(frame)
+        for index, frame in enumerate(frames):
+            base.clear_hidden_rgb(frame).save(folder / f"{index:02d}.png")
         rig_map[state] = face_lines(Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA"))
         keep = min(base.COLS, count)
         picks = [frames[round(k * (count - 1) / (keep - 1))] for k in range(keep)] if keep > 1 else frames
         for col, frame in enumerate(picks):
             sheet.alpha_composite(frame, (col * CELL_W, row * CELL_H))
-        print(f"{state:14s} {count} frames -> sheet row {row} keeps {len(picks)}")
+        print(f"{state:14s} {count:2d} frames  art box={box}  "
+              f"{'OK' if box[0] >= base.SAFE_SIDE and box[1] >= base.SAFE_TOP and box[2] <= CELL_W - base.SAFE_SIDE else 'VIOLATION'}")
     import json
     (OUT_FRAMES / "rig.json").write_text(json.dumps(rig_map, ensure_ascii=False, indent=2), encoding="utf-8")
     for state, lines in rig_map.items():
