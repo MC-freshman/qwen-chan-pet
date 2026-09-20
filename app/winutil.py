@@ -150,6 +150,12 @@ def qoder_main_window() -> int | None:
     return best[1] if best else None
 
 
+def cursor_pos() -> tuple[int, int]:
+    point = W.POINT()
+    user32.GetCursorPos(C.byref(point))
+    return point.x, point.y
+
+
 def foreground_title() -> str:
     return _window_text(user32.GetForegroundWindow())
 

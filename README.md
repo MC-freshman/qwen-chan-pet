@@ -48,29 +48,49 @@ powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 
 单击摸头 · 双击喂食 · 拖拽钉住 · 滚轮改大小 · 右键菜单（小睡 / 别说话 / 回到 Qoder 窗边 / 看看数值 / 写日记 / 退出）
 
+不用点她：她会**跟着你的光标转头**，你走开六秒后自己收回来（小睡 / 别说话 / 回到 Qoder 窗边 / 看看数值 / 写日记 / 退出）
+
 ## 参数（`app/config.json`）
 
 `follow_qoder` 是否吸附 Qoder 窗口右下角并跟随移动 · `perch_offset` 吸附偏移 ·
 `wander_range` 跑动范围 · `speech_min_gap_seconds` / `speech_max_per_hour` 说话节流 ·
 `quiet_hours` 静默时段 · `watchdog_grace_seconds` 退出宽限 · `long_work_minutes` 连续工作提醒阈值
 
+## 动效是怎么来的
+
+不是把几张图平移。`app/rigor.py` 只有两个原语，全部动画都由它们叠出来：
+
+- `shear_rows(image, offsets)` —— 按行水平位移（亚像素混合）
+- `band_scale(image, top, bottom, factor)` —— 按行纵向重采样某个横带
+
+在这两个原语上叠出四层运动：**基础编排**（位移/倾斜/挤压，`build_qwen_spritesheet.MOTION` 的关键帧按相位插值加密）+ **二级运动**（从运动自身速度取导数，让发梢、辫子、裙摆、帽子滞后于身体摆动，髋部为支点）+ **呼吸**（安静态胸腔纵向 ±1.1%）+ **眨眼**（每个循环里压扁眼带两帧）。
+
+运行时再加一层**视线跟随**：读光标相对她头部的水平偏移，量化成 7 档，用 `head_follow_profile` 只剪切头部——身体不动，头转向你。人离开 6 秒后自动停止跟随。
+
+| | 数值 |
+| --- | --- |
+| 帧数 | 114 帧 / 9 状态（每状态 8–16 帧，原先 57） |
+| 播放 | 目标 20fps，实测 15.7fps（Windows 定时器粒度 15.6ms，`after(50)` 落到 62.5ms） |
+| 常驻开销 | 约 4.7% 单核；帧按状态懒加载，只保留最近 4 个状态 |
+| 想要真 20fps | `config.json` 里 `hi_res_timer: true`（调 `timeBeginPeriod(1)`，会改变全系统定时器精度，故默认关） |
+
 ## 素材管线
 
 ```
-poses/*.png  →  build_qwen_spritesheet.py  →  out/spritesheet.webp  →  app/assets/
+poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠物，全帧率）
+                                  →  out/spritesheet.webp      （Qoder 包，每行降采样到 8 帧）
 ```
 
+`build_motion.py` 复用 `build_qwen_spritesheet.py` 的去背、安全区与姿态编排，两者共用同一份素材源。
 精灵表 `1536×1872`：8 列 × 9 行，每格 `192×208`，行序
-`idle / running-right / running-left / waving / jumping / failed / waiting / running / review`，
-各行帧数 `6/8/8/4/5/8/6/6/6`，多余列透明。
+`idle / running-right / running-left / waving / jumping / failed / waiting / running / review`。
 
-姿势图用文生图逐状态生成（同一段角色描述保证一致性），再程序化补帧：去白底、
-按状态自动缩放进安全框、位移/挤压/旋转做动效。两个坑写死在脚本里：
+两个坑写死在脚本里：
 
 - **安全区**：Qoder 桌宠窗是 `128×176` 而格子是 `192×208`，映射方式未知，所以素材统一收进
   居中的 `128×176` 盒并让顶部留白压过 `y=32`——contain / cover / 居中裁 / 底部对齐裁四种映射都不会削头
 - **键色窗口**：`-transparentcolor` 不能混合半透明像素，素材必须先放大再把 alpha 硬阈值到 0/255，
-  否则轮廓外会有一圈键色描边
+  剪切之后还要再硬阈值一次，否则轮廓外会有一圈键色描边
 
 ## 隐私
 

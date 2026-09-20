@@ -1,0 +1,198 @@
+"""Dense, layered animation frames for the standalone pet.
+
+The Qoder package is capped at 8 frames per row, so this emits two things from one
+pass: app/frames/<state>/*.png at full frame rate for the pet, and a subsampled
+spritesheet for the Qoder pet package. Secondary motion, breathing and blinking are
+applied on top of the base choreography in build_qwen_spritesheet.
+"""
+
+from __future__ import annotations
+
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+from PIL import Image
+
+ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "app"))
+
+import build_qwen_spritesheet as base  # noqa: E402  (the pose/safe-area pipeline)
+import rigor  # noqa: E402
+
+FRAMES = {
+    "idle": 16,
+    "running-right": 12,
+    "running-left": 12,
+    "waving": 8,
+    "jumping": 10,
+    "failed": 16,
+    "waiting": 16,
+    "running": 12,
+    "review": 12,
+}
+CALM = {"idle", "waiting", "review", "failed"}
+HIP_FRACTION = 0.66  # sway pivot, measured down the sprite
+EYE_BAND = (0.155, 0.215)  # eyes sit here within the art height on a chibi
+BLINK_WINDOW = 0.09
+
+CELL_W, CELL_H = base.FRAME_W, base.FRAME_H
+OUT_FRAMES = ROOT / "app" / "frames"
+OUT_SHEET = ROOT / "out" / "spritesheet.webp"
+
+
+def motion_at(state: str, index: int, count: int) -> tuple[float, float, float, float]:
+    """Sample the hand-authored keyframes cyclically at a denser frame rate."""
+    keys = base.MOTION[state]
+    t = index / count * len(keys)
+    i0 = int(t) % len(keys)
+    i1 = (i0 + 1) % len(keys)
+    f = t - int(t)
+    return tuple(keys[i0][k] + (keys[i1][k] - keys[i0][k]) * f for k in range(4))
+
+
+def place(content: Image.Image, dx: float, dy: float, state: str) -> Image.Image:
+    frame = Image.new("RGBA", (CELL_W, CELL_H), (0, 0, 0, 0))
+    cw, ch = content.size
+    x = round((CELL_W - cw) / 2 + dx + base.FIT[state][1])
+    y = round(CELL_H - base.BASELINE - ch + dy)
+    x = max(base.SAFE_SIDE, min(CELL_W - cw - base.SAFE_SIDE, x))
+    y = max(base.SAFE_TOP, min(CELL_H - ch - base.FOOT_MARGIN, y))
+    swing = max(-20.0, min(20.0, -(dx * 4.5)))
+    frame.alpha_composite(base.draw_charm(swing=swing, droop=1.0 if state == "failed" else 0.0), (12, 0))
+    frame.alpha_composite(content, (x, y))
+    return frame
+
+
+def art_span(content: Image.Image) -> tuple[int, int]:
+    box = content.getchannel("A").getbbox() or (0, 0, 1, 1)
+    return box[1], box[3]
+
+
+def fit_state(state: str, count: int, sprite: Image.Image) -> Image.Image:
+    """base.fit_state indexes the sparse keyframes, so re-derive the fit from the dense ones."""
+    height = base.FIT[state][0]
+    for _ in range(12):
+        scaled = base.fit(sprite, height)
+        need_h = need_w = 0
+        for index in range(count):
+            dx, dy, tilt, squash = motion_at(state, index, count)
+            body = base.transform(scaled, dx, dy, tilt, squash)
+            box = body.getchannel("A").getbbox()
+            cw, ch = body.crop(box).size
+            need_h = max(need_h, ch - min(dy, 0))
+            need_w = max(need_w, cw + 2 * abs(dx + base.FIT[state][1]))
+        if need_h <= CELL_H - base.BASELINE - base.SAFE_TOP and need_w <= CELL_W - base.SAFE_SIDE * 2:
+            return scaled
+        height = int(height * 0.96)
+    return base.fit(sprite, height)
+
+
+def animate(state: str, index: int, count: int, sprite: Image.Image) -> Image.Image:
+    dx, dy, tilt, squash = motion_at(state, index, count)
+    body = base.transform(sprite, dx, dy, tilt, squash)
+    box = body.getchannel("A").getbbox()
+    content = body.crop(box)
+    top, bottom = art_span(content)
+    height = max(1, bottom - top)
+
+    # Extremities trail the body: derive the sway from the motion's own velocity.
+    ahead = motion_at(state, (index + 1) % count, count)
+    behind = motion_at(state, (index - 1) % count, count)
+    velocity_x = (ahead[0] - behind[0]) * 0.5
+    velocity_y = (ahead[1] - behind[1]) * 0.5
+    amp = -velocity_x * 1.9 - velocity_y * 0.5
+    if abs(amp) > 0.15:
+        content = rigor.shear_rows(
+            content, rigor.simple_pendulum(content.height, top + height * HIP_FRACTION, amp)
+        )
+
+    phase = index / count
+    if state in CALM:
+        breath = 1.0 + 0.011 * math.sin(2 * math.pi * phase * 2)
+        centre = top + height * 0.52
+        content = rigor.band_scale(content, centre - height * 0.16, centre + height * 0.16, breath)
+
+    # One blink per cycle, two frames wide, only where the loop is long enough.
+    if count >= 12:
+        offset = abs(math.sin(2 * math.pi * (phase + 0.37 * (index % 3))))
+        if offset < BLINK_WINDOW:
+            content = rigor.band_scale(
+                content, top + height * EYE_BAND[0], top + height * EYE_BAND[1], 0.32
+            )
+    return place(content, dx, dy, state)
+
+
+def main() -> None:
+    OUT_SHEET.parent.mkdir(exist_ok=True)
+    (ROOT / "out" / "preview.png").parent.mkdir(exist_ok=True)
+    sheet = Image.new("RGBA", (CELL_W * base.COLS, CELL_H * base.ROWS), (0, 0, 0, 0))
+    for row, state in enumerate(base.ROW_STATES if hasattr(base, "ROW_STATES") else [s for s, _ in base.STATES]):
+        count = FRAMES[state]
+        sprite = base.trim(base.cutout(base.find_source(base.POSES[state])))
+        if state in base.MIRROR:
+            sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        sprite = fit_state(state, count, sprite)
+        folder = OUT_FRAMES / state
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in folder.glob("*.png"):
+            old.unlink()
+        frames = []
+        for index in range(count):
+            frame = base.clear_hidden_rgb(animate(state, index, count, sprite))
+            frame.save(folder / f"{index:02d}.png")
+            frames.append(frame)
+        keep = min(base.COLS, count)
+        picks = [frames[round(k * (count - 1) / (keep - 1))] for k in range(keep)] if keep > 1 else frames
+        for col, frame in enumerate(picks):
+            sheet.alpha_composite(frame, (col * CELL_W, row * CELL_H))
+        print(f"{state:14s} {count} frames -> sheet row {row} keeps {len(picks)}")
+    sheet.save(OUT_SHEET, lossless=True)
+    sheet.save(ROOT / "out" / "spritesheet.png")
+    base.preview(ROOT / "out" / "preview.png")
+    contact(ROOT / "out" / "contact.png")
+    verify()
+    print(f"sheet -> {OUT_SHEET}")
+
+
+def contact(target: Path) -> None:
+    states = ["idle", "running-right", "waiting"]
+    tiles = []
+    for state in states:
+        folder = OUT_FRAMES / state
+        files = sorted(folder.glob("*.png"))
+        strip = Image.new("RGBA", (CELL_W * len(files), CELL_H), (250, 250, 252, 255))
+        for col, path in enumerate(files):
+            strip.alpha_composite(Image.open(path).convert("RGBA"), (col * CELL_W, 0))
+        tiles.append((state, strip))
+    canvas = Image.new("RGB", (max(t.width for _, t in tiles), sum(t.height for _, t in tiles)), (250, 250, 252))
+    y = 0
+    for _, strip in tiles:
+        canvas.paste(strip.convert("RGB"), (0, y))
+        y += strip.height
+    canvas.save(target)
+
+
+def verify() -> None:
+    clear = {"left": 999, "right": 999, "top": 999, "bottom": 999}
+    total = 0
+    for state, count in FRAMES.items():
+        for path in sorted((OUT_FRAMES / state).glob("*.png")):
+            box = Image.open(path).getchannel("A").getbbox()
+            if box is None:
+                raise RuntimeError(f"empty frame {path}")
+            left, top, right, bottom = box
+            if left < 0 or top < 0 or right > CELL_W or bottom > CELL_H:
+                raise RuntimeError(f"{path} overflows the cell: {box}")
+            clear["left"] = min(clear["left"], left)
+            clear["top"] = min(clear["top"], top)
+            clear["right"] = min(clear["right"], CELL_W - right)
+            clear["bottom"] = min(clear["bottom"], CELL_H - bottom)
+            total += 1
+    print(f"{total} frames, tightest clearance {clear}")
+
+
+if __name__ == "__main__":
+    main()

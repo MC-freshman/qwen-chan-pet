@@ -15,6 +15,7 @@ import tkinter as tk
 from datetime import date, datetime
 from pathlib import Path
 
+import rigor
 import winutil
 from needs import Life, write_diary
 from speech import Speech
@@ -23,6 +24,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 APP = Path(__file__).resolve().parent
 SHEET = APP / "assets" / "spritesheet.webp"
+FRAMES_DIR = APP / "frames"
 CELL_W, CELL_H = 192, 208
 ROW_STATES = [
     "idle",
@@ -48,7 +50,7 @@ FRAME_COUNTS = {
 }
 MAGIC = "#ff00fe"
 BUBBLE_FONT = "C:/Windows/Fonts/msyh.ttc"
-FAST_TICK = 0.11
+FAST_TICK = 0.05
 SLOW_TICK = 1.0
 
 
@@ -175,6 +177,9 @@ class Pet:
         self.silent_until = 0.0
         self.said_this_hour: list[float] = []
         self.qoder_gone_since: float | None = None
+        self.placed_at = (-9999, -9999)
+        self.gaze = 0
+        self.last_gaze = 0.0
         self.session_start = time.time()
         self.next_slow = 0.0
         self.next_save = self.session_start + self.cfg["save_every_seconds"]
@@ -207,30 +212,78 @@ class Pet:
     def set_scale(self, scale: float) -> None:
         self.cfg["scale"] = round(max(0.45, min(1.6, scale)), 2)
         self.pixel_scale = self.cfg["scale"] * self.dpi
-        sheet = Image.open(SHEET).convert("RGBA")
-        self.photos: dict[tuple[str, int], ImageTk.PhotoImage] = {}
+        self.frame_size = (
+            max(1, round(CELL_W * self.pixel_scale)),
+            max(1, round(CELL_H * self.pixel_scale)),
+        )
+        self.cells: dict[str, list[Image.Image]] = {}
         self.head: dict[str, tuple[float, float]] = {}
-        width = max(1, round(CELL_W * self.pixel_scale))
-        height = max(1, round(CELL_H * self.pixel_scale))
-        for row, state in enumerate(ROW_STATES):
-            for col in range(FRAME_COUNTS[state]):
-                cell = sheet.crop(
-                    (col * CELL_W, row * CELL_H, (col + 1) * CELL_W, (row + 1) * CELL_H)
-                ).resize((width, height), Image.Resampling.LANCZOS)
-                if col == 0:
-                    self.head[state] = head_anchor(cell)
-                # The sheet's charm hangs from the cell top, which has no ceiling
-                # here; it now dangles from the speech bubble instead.
-                alpha = cell.getchannel("A")
-                ImageDraw.Draw(alpha).rectangle(
-                    [0, 0, round(cell.width * 0.32), round(cell.height * 0.16)], fill=0
+        self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
+        self.sheet = None if FRAMES_DIR.is_dir() else Image.open(SHEET).convert("RGBA")
+
+    def prepare(self, image: Image.Image) -> Image.Image:
+        cell = image.resize(self.frame_size, Image.Resampling.LANCZOS)
+        # The sheet's charm hangs from the cell top, which has no ceiling here;
+        # it now dangles from the speech bubble instead.
+        alpha = cell.getchannel("A")
+        ImageDraw.Draw(alpha).rectangle(
+            [0, 0, round(cell.width * 0.32), round(cell.height * 0.16)], fill=0
+        )
+        # A key-colour window cannot blend, so harden the silhouette edge.
+        cell.putalpha(alpha.point(lambda v: 255 if v >= 128 else 0))
+        return cell
+
+    def load_state(self, state: str) -> list[Image.Image]:
+        """Frames are ~5MB per state, so keep only the few most recent resident."""
+        cached = self.cells.get(state)
+        if cached:
+            return cached
+        folder = FRAMES_DIR / state
+        if folder.is_dir():
+            raw = [Image.open(path) for path in sorted(folder.glob("*.png"))]
+        else:
+            row = ROW_STATES.index(state)
+            raw = [
+                self.sheet.crop(
+                    (
+                        col * CELL_W,
+                        row * CELL_H,
+                        (col + 1) * CELL_W,
+                        (row + 1) * CELL_H,
+                    )
                 )
-                # A key-colour window cannot blend, so harden the silhouette edge.
-                cell.putalpha(alpha.point(lambda v: 255 if v >= 128 else 0))
-                flat = Image.new("RGB", (width, height), (255, 0, 254))
-                flat.paste(cell, (0, 0), cell)
-                self.photos[(state, col)] = ImageTk.PhotoImage(flat)
-        self.frame_size = (width, height)
+                for col in range(FRAME_COUNTS[state])
+            ]
+        cells = [self.prepare(image) for image in raw]
+        self.head[state] = head_anchor(cells[0])
+        self.cells[state] = cells
+        for other in list(self.cells):
+            if len(self.cells) <= 4:
+                break
+            if other != state:
+                del self.cells[other]
+        return cells
+
+    def render(self, state: str, index: int, gaze: int) -> ImageTk.PhotoImage:
+        key = (state, index, gaze)
+        photo = self.photos.get(key)
+        if photo is not None:
+            return photo
+        cells = self.load_state(state)
+        cell = cells[index % len(cells)]
+        if gaze:
+            hx, hy = self.head[state]
+            cell = rigor.shear_rows(
+                cell, rigor.head_follow_profile(cell.height, hy + cell.height * 0.1, gaze * 2.2)
+            )
+            cell.putalpha(cell.getchannel("A").point(lambda v: 255 if v >= 128 else 0))
+        flat = Image.new("RGB", cell.size, (255, 0, 254))
+        flat.paste(cell, (0, 0), cell)
+        photo = ImageTk.PhotoImage(flat)
+        if len(self.photos) > 150:
+            self.photos.clear()
+        self.photos[key] = photo
+        return photo
 
     def bind_events(self) -> None:
         self.label.bind("<ButtonPress-1>", self.on_press)
@@ -267,12 +320,27 @@ class Pet:
             self.state_until = now + self.dwell(self.state)
         self.frame_i += 1
         self.move(now)
-        photo = self.photos[(self.state, self.frame_i % FRAME_COUNTS[self.state])]
+        self.update_gaze(now)
+        cells = self.load_state(self.state)
+        photo = self.render(self.state, self.frame_i % len(cells), self.gaze)
         self.label.configure(image=photo)
         self.image = photo
         self.place()
         if self.bubble is not None:
             self.position_bubble()
+
+    def update_gaze(self, now: float) -> None:
+        """She turns her head toward the cursor, and stops when nobody is around."""
+        if now - self.last_gaze < 0.12:
+            return
+        self.last_gaze = now
+        if winutil.idle_seconds() > 6.0:
+            self.gaze = 0
+            return
+        hx, hy = self.head.get(self.state, (self.frame_size[0] / 2, self.frame_size[1] * 0.2))
+        cursor_x, _ = winutil.cursor_pos()
+        offset = cursor_x - (self.x + hx)
+        self.gaze = max(-3, min(3, int(round(offset / 110))))
 
     def dwell(self, state: str) -> float:
         if state in ("running-right", "running-left", "running"):
@@ -544,8 +612,12 @@ class Pet:
         self.place()
 
     def place(self) -> None:
+        where = (int(self.x), int(self.y))
+        if where == self.placed_at:
+            return
+        self.placed_at = where  # geometry() forces a repaint on a key-colour window
         width, height = self.frame_size
-        self.root.geometry(f"{width}x{height}+{int(self.x)}+{int(self.y)}")
+        self.root.geometry(f"{width}x{height}+{where[0]}+{where[1]}")
 
     # ---------- menu ----------
 
@@ -642,6 +714,12 @@ def main() -> None:
         except json.JSONDecodeError:
             pass
     config.setdefault("muted", False)
+    if config.get("hi_res_timer"):
+        # Tk's after() lands on the 15.6ms system tick; raising it to 1ms gets a true
+        # 20fps but changes the timer resolution for the whole machine, so it is opt-in.
+        import ctypes
+
+        ctypes.windll.winmm.timeBeginPeriod(1)
     pet = Pet(config)
     pet.root.mainloop()
 
