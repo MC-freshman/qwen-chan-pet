@@ -7,3 +7,6 @@ app/save.json
 app/diary/
 app/config.local.json
 app/run/
+
+# 探针：第三方模型与 npm 依赖不入库（Live2D 示例/Bongo 猫模型均有授权限制）
+probe/
