@@ -70,3 +70,65 @@ def head_follow_profile(height: int, head_bottom: float, amp: float, shoulder: f
     ys = np.arange(height, dtype=float)
     ramp = np.clip((head_bottom - ys) / max(1.0, shoulder), 0.0, 1.0)
     return amp * ramp
+
+
+def _smoothstep(x):
+    x = np.clip(x, 0.0, 1.0)
+    return x * x * (3.0 - 2.0 * x)
+
+
+def polar_twist(image, pivot, amp_deg, r_in, r_out, theta0, theta1, feather=22.0):
+    """Rotate an annular sector about the pivot, feathered on every edge.
+
+    This is the mask-free stand-in for a Live2D part deformer: the limb or hair
+    tip turns around a real joint instead of the whole sprite sliding sideways.
+    """
+    arr = np.array(image.convert("RGBA"), dtype=np.float32)
+    height, width = arr.shape[:2]
+    px, py = pivot
+    ys, xs = np.mgrid[0:height, 0:width].astype(np.float32)
+    dx = xs - px
+    dy = ys - py
+    radius = np.hypot(dx, dy)
+    angle = np.degrees(np.arctan2(dy, dx))
+    radial = _smoothstep((radius - r_in) / max(1.0, r_out - r_in))
+    # keep the far edge from unwinding past the sector
+    radial *= 1.0 - _smoothstep((radius - r_out) / max(1.0, r_out * 0.35)) * 0.35
+    lo = np.arctan2(np.sin(np.radians(theta0)), np.cos(np.radians(theta0)))
+    hi = np.arctan2(np.sin(np.radians(theta1)), np.cos(np.radians(theta1)))
+    span = np.degrees((hi - lo) % (2 * np.pi))
+    pos = (angle - np.degrees(lo)) % 360.0
+    angular = _smoothstep(pos / max(1.0, feather)) * _smoothstep((span + feather - pos) / max(1.0, feather))
+    shifted = np.radians(angle - amp_deg * radial * angular)
+    src_x = px + radius * np.cos(shifted)
+    src_y = py + radius * np.sin(shifted)
+    x0 = np.floor(src_x).astype(np.int32)
+    y0 = np.floor(src_y).astype(np.int32)
+    fx = (src_x - x0)[..., None]
+    fy = (src_y - y0)[..., None]
+    x0 = np.clip(x0, 0, width - 1)
+    y0 = np.clip(y0, 0, height - 1)
+    x1 = np.clip(x0 + 1, 0, width - 1)
+    y1 = np.clip(y0 + 1, 0, height - 1)
+    a = arr[y0, x0] * (1 - fx) * (1 - fy) + arr[y0, x1] * fx * (1 - fy)
+    b = arr[y1, x0] * (1 - fx) * fy + arr[y1, x1] * fx * fy
+    out = np.clip(a + b, 0, 255).astype(np.uint8)
+    out[out[:, :, 3] == 0, :3] = 0
+    return Image.fromarray(out, "RGBA")
+
+
+class Spring:
+    """Critically tunable 1-D spring, stepped per frame to give parts overshoot."""
+
+    __slots__ = ("x", "v", "k", "c")
+
+    def __init__(self, k=42.0, c=6.5, value=0.0):
+        self.x = value
+        self.v = 0.0
+        self.k = k      # stiffness
+        self.c = c      # damping
+
+    def step(self, target: float, dt: float) -> float:
+        self.v += (self.k * (target - self.x) - self.c * self.v) * dt
+        self.x += self.v * dt
+        return self.x

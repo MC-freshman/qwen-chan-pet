@@ -34,6 +34,8 @@ FRAMES = {
     "review": 12,
 }
 CALM = {"idle", "waiting", "review", "failed"}
+HEAD_SECTOR = (-140.0, -40.0)   # image y grows down, so "up" is -90
+SKIRT_SECTOR = (40.0, 140.0)
 HIP_FRACTION = 0.66  # sway pivot, measured down the sprite
 EYE_BAND = (0.155, 0.215)  # eyes sit here within the art height on a chibi
 BLINK_WINDOW = 0.09
@@ -41,6 +43,46 @@ BLINK_WINDOW = 0.09
 CELL_W, CELL_H = base.FRAME_W, base.FRAME_H
 OUT_FRAMES = ROOT / "app" / "frames"
 OUT_SHEET = ROOT / "out" / "spritesheet.webp"
+
+
+def part_rig(sprite: Image.Image) -> dict:
+    """Pivots and radii derived from the silhouette, so every pose rigs itself."""
+    import numpy as np
+
+    box = sprite.getchannel("A").getbbox() or (0, 0, sprite.width, sprite.height)
+    left, top, right, bottom = box
+    w, h = right - left, bottom - top
+    cx = left + w / 2
+    return {
+        "head": {"pivot": (cx, top + h * 0.34), "r_in": h * 0.02, "r_out": h * 0.34,
+                 "sector": HEAD_SECTOR},
+        "skirt": {"pivot": (cx, top + h * 0.60), "r_in": h * 0.06, "r_out": h * 0.46,
+                  "sector": SKIRT_SECTOR},
+    }
+
+
+def spring_series(state: str, count: int) -> tuple[list, list]:
+    """Run the springs across the loop twice so the recorded frames start settled."""
+    head, skirt = [], []
+    sh, ss = rigor.Spring(k=52.0, c=7.4), rigor.Spring(k=34.0, c=5.2)
+    dt = 1.0 / 16.0   # 软弹簧：跑动的横向甩动交给速度驱动的钟摆剪切，这里只管滞后回弹
+    for lap in range(3):
+        head, skirt = [], []
+        for index in range(count):
+            ahead = motion_at(state, (index + 1) % count, count)
+            behind = motion_at(state, (index - 1) % count, count)
+            vx = (ahead[0] - behind[0]) * 0.5
+            vy = (ahead[1] - behind[1]) * 0.5
+            tilt_v = (ahead[2] - behind[2]) * 0.5
+            # head fights the body, skirt trails it
+            ht = -tilt_v * 2.2 - vx * 0.35
+            st = -vx * 2.6 - vy * 0.5
+            if lap == 2:
+                head.append(sh.step(ht, dt))
+                skirt.append(ss.step(st, dt))
+            else:
+                sh.step(ht, dt); ss.step(st, dt)
+    return head, skirt
 
 
 def motion_at(state: str, index: int, count: int) -> tuple[float, float, float, float]:
@@ -90,7 +132,8 @@ def fit_state(state: str, count: int, sprite: Image.Image) -> Image.Image:
     return base.fit(sprite, height)
 
 
-def animate(state: str, index: int, count: int, sprite: Image.Image) -> Image.Image:
+def animate(state: str, index: int, count: int, sprite: Image.Image,
+            springs: tuple) -> Image.Image:
     dx, dy, tilt, squash = motion_at(state, index, count)
     body = base.transform(sprite, dx, dy, tilt, squash)
     box = body.getchannel("A").getbbox()
@@ -107,6 +150,19 @@ def animate(state: str, index: int, count: int, sprite: Image.Image) -> Image.Im
     if abs(amp) > 0.15:
         content = rigor.shear_rows(
             content, rigor.simple_pendulum(content.height, top + height * HIP_FRACTION, amp)
+        )
+
+    # Real joints: the head counter-rotates to hold the gaze while the skirt trails.
+    # Pivots come from the deformed silhouette, so they follow tilt and squash.
+    rig = part_rig(content)
+    head_amp, skirt_amp = springs
+    for part, value in (("head", head_amp[index]), ("skirt", skirt_amp[index])):
+        if abs(value) < 0.25:
+            continue
+        spec = rig[part]
+        content = rigor.polar_twist(
+            content, spec["pivot"], value,
+            spec["r_in"], spec["r_out"], spec["sector"][0], spec["sector"][1],
         )
 
     phase = index / count
@@ -135,13 +191,14 @@ def main() -> None:
         if state in base.MIRROR:
             sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         sprite = fit_state(state, count, sprite)
+        springs = spring_series(state, count)
         folder = OUT_FRAMES / state
         folder.mkdir(parents=True, exist_ok=True)
         for old in folder.glob("*.png"):
             old.unlink()
         frames = []
         for index in range(count):
-            frame = base.clear_hidden_rgb(animate(state, index, count, sprite))
+            frame = base.clear_hidden_rgb(animate(state, index, count, sprite, springs))
             frame.save(folder / f"{index:02d}.png")
             frames.append(frame)
         keep = min(base.COLS, count)
