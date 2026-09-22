@@ -16,6 +16,7 @@ APP = Path(__file__).resolve().parent
 RUN = APP / "run"
 PET = APP / "pet.pyw"
 PET_PID = RUN / "pet.pid"
+QUIT_FLAG = RUN / "quit"
 POLL_SECONDS = 3.0
 GRACE_SECONDS = 20.0  # the pet has its own watchdog; this only cleans up strays
 
@@ -62,13 +63,17 @@ def main() -> None:
     if pythonw != "pythonw.exe":
         print("提示：用 pythonw.exe 启动哨兵才不会留控制台窗口", file=sys.stderr)
     qoder_since: float | None = None
+    qoder_was_up = bool(winutil.process_ids(winutil.QODER_EXE))
     while True:
         running = bool(winutil.process_ids(winutil.QODER_EXE))
+        if qoder_was_up and not running:
+            QUIT_FLAG.unlink(missing_ok=True)   # Qoder 关过一轮 = 上一次"别烦我"作废
+        qoder_was_up = running
         current = pet_pid()
         alive = current and winutil.process_alive(current)
         if running:
             qoder_since = None
-            if not alive:
+            if not alive and not QUIT_FLAG.exists():
                 start_pet()
         elif alive:
             # Pet's own watchdog should have quit; only force-kill after a grace period.

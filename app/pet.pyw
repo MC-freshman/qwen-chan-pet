@@ -177,6 +177,9 @@ class Pet:
         self.silent_until = 0.0
         self.said_this_hour: list[float] = []
         self.qoder_gone_since: float | None = None
+        self.paused = False
+        self.qoder_hwnd = 0
+        self.pid = winutil.kernel32.GetCurrentProcessId()
         self.placed_at = (-9999, -9999)
         self.gaze = 0
         self.last_gaze = 0.0
@@ -301,10 +304,20 @@ class Pet:
 
     def loop(self) -> None:
         now = time.time()
+        if self.paused:
+            self.root.after(500, self.loop)
+            if not winutil.fullscreen_foreground(self.pid, self.qoder_hwnd):
+                self.resume()
+            return
         self.animate(now)
         if now >= self.next_slow:
             self.next_slow = now + SLOW_TICK
+            if winutil.fullscreen_foreground(self.pid, self.qoder_hwnd):
+                self.pause()
+                self.root.after(500, self.loop)   # 必须续期，否则挂起后再也没人唤醒她
+                return
             hwnd = winutil.qoder_main_window()
+            self.qoder_hwnd = hwnd or 0
             self.refresh_perch(hwnd)
             self.life.note_context(*self.foreground())
             if self.check_qoder(now, hwnd):
@@ -365,15 +378,22 @@ class Pet:
             self.y += (self.floor - self.y) * 0.2
         limit = self.cfg["wander_range"] * self.pixel_scale
         if self.x > self.anchor + limit:
-            self.state, self.frame_i = "running-left", 0
+            if self.state != "running-left":
+                self.state = "running-left"   # 不重置 frame_i：越界会持续多个 tick
         elif self.x < self.anchor - limit:
-            self.state, self.frame_i = "running-right", 0
+            if self.state != "running-right":
+                self.state = "running-right"
         self.x = max(-20, min(self.root.winfo_screenwidth() - 30, self.x))
 
     def choose_state(self, now: float) -> str:
         if now < self.forced_until and self.forced_state:
             return self.forced_state
         self.forced_state = None
+        limit = self.cfg["wander_range"] * self.pixel_scale
+        if self.x > self.anchor + limit:
+            return "running-left"          # 越界期间先走回来，别让随机状态再把她推出去
+        if self.x < self.anchor - limit:
+            return "running-right"
         if self.life.sleeping:
             return "waiting"
         energy, mood = self.life.needs["energy"], self.life.needs["mood"]
@@ -401,6 +421,23 @@ class Pet:
         self.forced_until = time.time() + seconds
         self.state, self.frame_i = state, 0
         self.state_until = self.forced_until
+
+    # ---------- fullscreen courtesy ----------
+
+    def pause(self) -> None:
+        """A topmost layered window repainting under an exclusive-fullscreen game can
+        kick the game out of fullscreen, so she disappears instead of being polite."""
+        self.paused = True
+        self.hide_bubble()
+        self.root.withdraw()
+
+    def resume(self) -> None:
+        self.paused = False
+        self.root.deiconify()
+        self.refresh_perch(winutil.qoder_main_window(), force=True)
+        self.x, self.y = self.anchor, self.floor
+        self.placed_at = (-9999, -9999)
+        self.place()
 
     # ---------- perch and watchdog ----------
 
@@ -538,7 +575,10 @@ class Pet:
         x = int(self.x + hx - tip_x)
         y = int(self.y + hy - tip_y - 3 * self.pixel_scale)
         x = max(4, min(x, self.root.winfo_screenwidth() - width - 4))
-        self.bubble.geometry(f"{width}x{height}+{x}+{max(4, y)}")
+        request = f"{width}x{height}+{x}+{max(4, y)}"
+        if request != getattr(self, "bubble_placed", None):
+            self.bubble_placed = request   # geometry() repaints a key-colour window
+            self.bubble.geometry(request)
 
     def hide_bubble(self, generation: int | None = None) -> None:
         if generation is not None and generation != self.bubble_gen:
@@ -641,7 +681,7 @@ class Pet:
         menu.add_command(label="看看数值", command=self.show_status)
         menu.add_command(label="写日记", command=self.write_diary_now)
         menu.add_separator()
-        menu.add_command(label="退出（只关她，不动 Qoder）", command=self.quit)
+        menu.add_command(label="退出（本次 Qoder 期间不再自动回来）", command=self.quit)
         menu.tk_popup(event.x_root, event.y_root)
 
     def toggle_sleep(self) -> None:
@@ -689,7 +729,10 @@ class Pet:
             self.life.diary_day = today
             write_diary(APP / "diary", self.life, date.today())
 
-    def quit(self) -> None:
+    def quit(self, intent: bool = True) -> None:
+        if intent:
+            (APP / "run").mkdir(exist_ok=True)
+            (APP / "run" / "quit").write_text(str(int(time.time())), encoding="utf-8")
         self.life.save()
         try:
             self.cfg.pop("muted", None)

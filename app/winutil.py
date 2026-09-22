@@ -156,6 +156,48 @@ def cursor_pos() -> tuple[int, int]:
     return point.x, point.y
 
 
+WS_CAPTION = 0x00C00000
+GWL_STYLE = -16
+
+
+def window_pid(hwnd: int) -> int:
+    pid = W.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, C.byref(pid))
+    return pid.value
+
+
+SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "TopLevelWindowForOverflowXamlIsland"}
+
+
+def window_is_borderless_fullscreen(hwnd: int) -> bool:
+    """A caption-less window covering (almost) the whole screen: a game, not an editor."""
+    if not hwnd or not user32.IsWindowVisible(hwnd):
+        return False
+    buffer = C.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, buffer, 64)
+    if buffer.value in SHELL_CLASSES:  # the desktop and taskbar are borderless too
+        return False
+    style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
+    if style & WS_CAPTION:
+        return False
+    rect = W.RECT()
+    user32.GetWindowRect(hwnd, C.byref(rect))
+    width, height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
+    return (rect.right - rect.left) >= width * 0.98 and (rect.bottom - rect.top) >= height * 0.98
+
+
+def fullscreen_foreground(exclude_pid: int, exclude_hwnd: int = 0) -> bool:
+    """True when the app in front is borderless and screen-filling.
+
+    A topmost layered pet repainting under an exclusive-fullscreen game can drop the
+    game out of fullscreen, so she has to get out of the way rather than be polite.
+    """
+    hwnd = user32.GetForegroundWindow()
+    if hwnd == exclude_hwnd or (hwnd and window_pid(hwnd) == exclude_pid):
+        return False
+    return window_is_borderless_fullscreen(hwnd)
+
+
 def foreground_title() -> str:
     return _window_text(user32.GetForegroundWindow())
 
