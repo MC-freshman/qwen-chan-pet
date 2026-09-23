@@ -190,6 +190,7 @@ class Pet:
         self.bind_events()
 
         offline = self.life.apply_offline()
+        self.last_life = time.time()
         self.refresh_perch(force=True)
         self.x, self.y = self.anchor, self.floor
         self.greeting(offline)
@@ -312,6 +313,8 @@ class Pet:
         self.animate(now)
         if now >= self.next_slow:
             self.next_slow = now + SLOW_TICK
+            self.life.tick((now - self.last_life) / 60.0)
+            self.last_life = now
             if winutil.fullscreen_foreground(self.pid, self.qoder_hwnd):
                 self.pause()
                 self.root.after(500, self.loop)   # 必须续期，否则挂起后再也没人唤醒她

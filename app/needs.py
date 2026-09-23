@@ -60,7 +60,9 @@ class Life:
         self.last_seen = float(raw.get("last_seen", time.time()))
         self.first_met = int(raw.get("first_met", self.first_met))
         self.stats.update(raw.get("stats", {}))
-        self.hours.update({int(k): v for k, v in (raw.get("hours") or {}).items()})
+        # note_context keys by str(hour); a second dtype here means dict(self.hours)
+        # serializes two entries for the same hour and the next load keeps only one.
+        self.hours.update({str(k): v for k, v in (raw.get("hours") or {}).items()})
         self.apps.update(raw.get("apps") or {})
         self.files.update(raw.get("files") or {})
         self.line_history = list(raw.get("line_history") or [])
@@ -74,6 +76,7 @@ class Life:
         minutes = self.offline_minutes()
         if minutes > 1:
             self._drain(minutes, sleeping=self.sleeping)
+        self.last_seen = time.time()
         return minutes
 
     def tick(self, minutes: float) -> None:
@@ -151,8 +154,8 @@ def write_diary(diary_dir: Path, life: Life, today: date) -> None:
     lines = [
         f"# {today.isoformat()}",
         "",
-        f"- 一起在线 {round(life.stats.get('minutes_online', 0))} 分钟",
-        f"- 摸头 {life.stats.get('pets', 0)} 次，喂食 {life.stats.get('feeds', 0)} 次",
+        f"- 累计一起在线 {round(life.stats.get('minutes_online', 0))} 分钟",
+        f"- 累计摸头 {life.stats.get('pets', 0)} 次，喂食 {life.stats.get('feeds', 0)} 次",
         f"- 心情 {life.needs['mood']:.0f} / 精力 {life.needs['energy']:.0f} / 亲密 {life.needs['affection']:.0f}",
     ]
     if peak is not None:
