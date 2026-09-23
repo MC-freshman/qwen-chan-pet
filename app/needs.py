@@ -88,7 +88,13 @@ class Life:
 
     def _drain(self, minutes: float, sleeping: bool) -> None:
         for key, rate in DECAY.items():
-            gain = minutes * (SLEEP_ENERGY_RATE if (sleeping and key == "energy") else rate)
+            if key == "energy":
+                gain = minutes * (SLEEP_ENERGY_RATE if sleeping else rate)
+            else:
+                # Napping is rest, not suffering: everything but energy still trickles
+                # down, just slowly. At full rate a long sleep pinned mood at zero and
+                # she then refused every pat, which is how she stays at zero.
+                gain = minutes * (rate / 3.0 if sleeping else rate)
             self.needs[key] = _clamp(self.needs[key] + gain)
 
     def bump(self, key: str, amount: float) -> float:

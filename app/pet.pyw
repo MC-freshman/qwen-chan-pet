@@ -862,6 +862,11 @@ class Pet:
             self.say(self.speech.pick("touch", "annoyed", **self.line_vars()))
             return
         if self.life.needs["mood"] < 30:
+            # She is too gloomy to show it, but the contact still registers: the mood
+            # gain is the same as a happy pat, only the reaction differs. Gating the
+            # reward behind the mood floor is how she stayed pinned at zero forever.
+            self.life.bump("mood", 2.0)
+            self.life.bump("affection", 1.0)
             self.force("failed", 1.4)
             self.say(self.speech.pick("touch", "reject", **self.line_vars()))
             return
