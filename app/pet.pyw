@@ -60,12 +60,15 @@ DEFAULT_CYCLE = 2.0
 PHOTO_CACHE = 420
 RESIDENT_STATES = 6
 MAGIC = "#ff00fe"
+# The window is refreshed at 30fps; the runtime deformation only at this rate, because
+# a deformed frame is unique and costs ~7ms while the extra ticks only need her position.
+LIFE_HZ = 20.0
 # A key-colour window cannot blend, so the silhouette edge is hardened to 0/255.
 # As a 256-entry table: Image.point with a Python lambda costs a callback per pixel,
 # which was most of the frame time.
 HARD_ALPHA = [0 if v < 128 else 255 for v in range(256)]
 BUBBLE_FONT = "C:/Windows/Fonts/msyh.ttc"
-FAST_TICK = 0.05
+FAST_TICK = 1 / 30
 SLOW_TICK = 1.0
 
 
@@ -220,6 +223,9 @@ class Pet:
         self.last_watched = 0.0
         self.swallow_release = False
         self.current: Image.Image | None = None
+        self.live_step = -1
+        self.live_at: tuple | None = None
+        self.live_photo = None
         self.next_slow = 0.0
         self.next_save = self.session_start + self.cfg["save_every_seconds"]
         self.next_speech = self.session_start + self.rng.uniform(12, 24)
@@ -318,37 +324,57 @@ class Pet:
         return cells
 
     def render(self, state: str, index: int, gaze: int, live: float | None = None) -> ImageTk.PhotoImage:
-        """One drawn frame. `live` is the wall clock for the life layer, and a frame
-        that has been deformed by it is unique, so it never enters the photo cache."""
-        key = (state, index, gaze)
+        """One drawn frame. `live` is the wall clock for the life layer.
+
+        The window is refreshed at 30fps so her movement and the physics read smooth,
+        but a live frame is unique and costs ~7ms, so the deformation itself is
+        quantised to LIFE_HZ and the extra ticks reuse the picture she is already in.
+        """
         if live is None:
+            key = (state, index, gaze)
             photo = self.photos.get(key)
             if photo is not None:
                 # keep the silhouette we test clicks against in step with what is drawn
                 self.current = self.cells[state][index % len(self.cells[state])]
                 return photo
+        else:
+            step = int(live * LIFE_HZ)
+            if step == self.live_step and (state, index, gaze) == self.live_at:
+                return self.live_photo
+            self.live_step, self.live_at = step, (state, index, gaze)
         cells = self.load_state(state)
         cell = cells[index % len(cells)]
+        height = cell.height
+        unit = height / DISPLAY_BASE[1]
+        # Every horizontal runtime effect is a per-row shift, so they add into one
+        # profile and one shear. The chin/eye rows come from rig.json as fractions,
+        # because the frames are rendered at 2x the cell they were designed in.
+        profile = None
         if gaze:
             hx, hy = self.head[state]
-            # Gaze landmarks are stored as fractions of the cell, and the pixel
-            # bands below are authored against a 208px cell, so both scale here.
-            unit = cell.height / DISPLAY_BASE[1]
             chin_row = (self.rig.get(state) or {}).get("chin")
-            chin = chin_row * cell.height if chin_row else hy + cell.height * 0.24
-            cell = rigor.shear_rows_fast(
-                cell, rigor.head_follow_profile(cell.height, chin, gaze * 2.2 * unit, shoulder=26.0 * unit)
-            )
+            chin = chin_row * height if chin_row else hy + height * 0.24
+            profile = rigor.head_follow_profile(height, chin, gaze * 1.6, shoulder=26.0 * unit)
         if live is not None:
-            cell = self.layer.apply(cell, live)
-        if self.squash or self.lean:
-            # Landing compresses her from the feet up; a throw leans the whole body.
-            cell = rigor.scale_about(cell, 1.0 - self.squash, cell.height - 1)
-            if abs(self.lean) > 0.05:
-                cell = rigor.shear_rows_fast(
-                    cell, rigor.simple_pendulum(cell.height, cell.height * 0.92, self.lean)
-                )
-        if gaze or live is not None or self.squash or self.lean:
+            layer_profile = self.layer.offsets(height, live)
+            profile = layer_profile if profile is None else profile + layer_profile
+        if abs(self.lean) > 0.05:
+            # Everything above the neck rides along rigidly - without that the hat
+            # smears, which is how the baked frames behaved before.
+            lean = rigor.simple_pendulum(height, height * 0.92, self.lean, rigid_above=height * 0.30)
+            profile = lean if profile is None else profile + lean
+        if profile is not None:
+            cell = rigor.shear_rows_fast(cell, profile)
+        if live is not None:
+            cell = rigor.band_scale_fast(cell, height * 0.36, height * 0.68, self.layer.breath(live))
+            blink = self.layer.blink(live)
+            band = self.layer.blink_band(height) if blink != 1.0 else None
+            if band:
+                cell = rigor.band_scale_fast(cell, band[0], band[1], blink)
+        if self.squash:
+            # Landing compresses her from the feet up, with the body bulging to match.
+            cell = rigor.squash_stretch(cell, 1.0 - self.squash, height - 1)
+        if profile is not None or live is not None or self.squash:
             cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         self.current = cell
         flat = Image.new("RGB", cell.size, (255, 0, 254))
@@ -359,6 +385,8 @@ class Pet:
             while len(self.photos) > PHOTO_CACHE:
                 self.photos.pop(next(iter(self.photos)))  # oldest first: dropping them all
                 # at once costs a full repaint pass and shows up as a hitch.
+        else:
+            self.live_photo = photo
         return photo
 
     def sync_landmarks(self) -> None:
@@ -840,8 +868,7 @@ class Pet:
         self.lean *= math.exp(-dt * 5.0)
         now = time.time()
         if now < self.tickle_until:
-            unit = self.frame_size[1] / DISPLAY_BASE[1]
-            self.lean = math.sin(now * 22.0) * 5.0 * unit
+            self.lean = math.sin(now * 22.0) * 4.0
         if not self.airborne:
             return
         left, _top, right, bottom = winutil.work_area()
@@ -850,11 +877,11 @@ class Pet:
         self.velocity = (velocity_x * math.exp(-dt * 0.7), velocity_y + 2400.0 * dt)
         self.x += self.velocity[0] * dt
         self.y += self.velocity[1] * dt
-        self.lean = max(-12.0, min(12.0, -self.velocity[0] * 0.012))
+        self.lean = max(-9.0, min(9.0, -self.velocity[0] * 0.010))
         if self.y >= floor:
             self.y = floor
             impact = abs(velocity_y)
-            self.squash = min(0.16, impact / 9000.0)
+            self.squash = min(0.10, impact / 12000.0)
             self.velocity = (self.velocity[0] * 0.55, -impact * 0.34)
             if impact > 700:
                 self.react("dizzy", "waiting", 1.0)
@@ -899,7 +926,7 @@ class Pet:
         self.life.bump("mood", 2.0 * gain)
         self.life.bump("curiosity", 1.0)
         if zone == "hat":
-            self.lean = 6.0 * (self.frame_size[1] / DISPLAY_BASE[1])
+            self.lean = 5.0
         wanted, fallback = ZONE_STATE.get(zone, ("waving", "waving"))
         self.react(wanted, fallback, 1.4)
         self.say(self.speech.pick("touch", zone) or self.speech.pick("touch", "pet"))

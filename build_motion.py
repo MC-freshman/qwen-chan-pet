@@ -108,6 +108,30 @@ OUT_FRAMES = ROOT / "app" / "frames"
 OUT_SHEET = ROOT / "out" / "spritesheet.webp"
 CONFIG = ROOT / "app" / "config.json"
 
+# A run cycle needs more than one bounce: with a single pose the pet reads as a
+# picture hopping along the desk. Two stride frames alternate every STRIDE frames.
+POSE_SETS = {
+    "running-right": ("qwen-chibi-run-a", "qwen-chibi-run-b"),
+    "running-left": ("qwen-chibi-run-a", "qwen-chibi-run-b"),
+    "running": ("qwen-chibi-run-a", "qwen-chibi-run-b"),
+}
+STRIDE = 4
+
+
+def stride_frame(state: str, index: int) -> int:
+    return (index // STRIDE) % 2 if state in POSE_SETS else 0
+
+
+def load_sprites(state: str) -> list[Image.Image]:
+    names = POSE_SETS.get(state) or [POSES[state]]
+    sprites = []
+    for name in names:
+        sprite = base.trim(base.cutout(base.find_source(name)))
+        if state in base.MIRROR:
+            sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        sprites.append(sprite)
+    return sprites
+
 
 def cycle_seconds() -> dict[str, float]:
     """How long one loop of each state lasts, shared with the running pet."""
@@ -222,12 +246,13 @@ def art_span(content: Image.Image) -> tuple[int, int]:
     return box[1], box[3]
 
 
-def render_state(state: str, count: int, sprite: Image.Image, height: int, cycle: float,
+def render_state(state: str, count: int, sprites: list, height: int, cycle: float,
                  baked_life: bool = True):
-    scaled = base.fit(sprite, height, max_width=CELL_W - 6 * S)
+    scaled = [base.fit(sprite, height, max_width=CELL_W - 6 * S) for sprite in sprites]
     springs = spring_series(state, count, cycle)
     return scaled, [
-        animate(state, index, count, scaled, springs, cycle, charm=False, baked_life=baked_life)
+        animate(state, index, count, scaled[stride_frame(state, index)], springs, cycle,
+                charm=False, baked_life=baked_life)
         for index in range(count)
     ]
 
@@ -242,7 +267,7 @@ def art_box(frame: Image.Image) -> tuple[int, int, int, int]:
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
-def fit_state(state: str, count: int, sprite: Image.Image, cycle: float):
+def fit_state(state: str, count: int, sprites: list, cycle: float):
     """Shrink until the *finished* frames fit the safe box.
 
     The previous estimate looked only at the pre-deformation sprite, so the pendulum,
@@ -251,7 +276,7 @@ def fit_state(state: str, count: int, sprite: Image.Image, cycle: float):
     layer on, since that is the largest the silhouette ever gets.
     """
     height = FIT[state][0]
-    scaled, frames = render_state(state, count, sprite, height, cycle, baked_life=True)
+    scaled, frames = render_state(state, count, sprites, height, cycle, baked_life=True)
     box = (0, 0, 0, 0)
     for _ in range(5):
         boxes = [art_box(frame) for frame in frames]
@@ -265,7 +290,7 @@ def fit_state(state: str, count: int, sprite: Image.Image, cycle: float):
             break
         span = max(1.0, bottom - top)
         height = max(110 * S, int(height * max(0.80, 1.0 - need / span) * 0.97))
-        scaled, frames = render_state(state, count, sprite, height, cycle, baked_life=True)
+        scaled, frames = render_state(state, count, sprites, height, cycle, baked_life=True)
     return scaled, frames, box
 
 
@@ -364,18 +389,16 @@ def main() -> None:
             continue
         count = FRAMES[state]
         cycle = cycles[state]
-        sprite = base.trim(base.cutout(base.find_source(POSES[state])))
-        if state in base.MIRROR:
-            sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        sprite, _probe, box = fit_state(state, count, sprite, cycle)
+        sprites = load_sprites(state)
+        scaled, _probe, box = fit_state(state, count, sprites, cycle)
         springs = spring_series(state, count, cycle)
         folder = OUT_FRAMES / state
         folder.mkdir(parents=True, exist_ok=True)
         for old in folder.glob("*.png"):
             old.unlink()
         for index in range(count):
-            frame = animate(state, index, count, sprite, springs, cycle,
-                            charm=False, baked_life=False)
+            frame = animate(state, index, count, scaled[stride_frame(state, index)], springs,
+                            cycle, charm=False, baked_life=False)
             base.clear_hidden_rgb(frame).save(folder / f"{index:02d}.png")
         first = Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA")
         lines = face_lines(first)
@@ -389,8 +412,8 @@ def main() -> None:
             for col, index in enumerate(picks):
                 # The sheet keeps its ceiling ornament and its baked breathing and blinks:
                 # a Qoder pet window has no life layer running under it.
-                charming = animate(state, index, count, sprite, springs, cycle,
-                                   charm=True, baked_life=True)
+                charming = animate(state, index, count, scaled[stride_frame(state, index)],
+                                   springs, cycle, charm=True, baked_life=True)
                 sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
         print(f"{state:14s} {count:2d} frames / {cycle:.2f}s = {count / cycle:4.1f}fps  art box={box}  "
               f"{'OK' if box[0] >= SAFE_SIDE and box[1] >= SAFE_TOP and box[2] <= CELL_W - SAFE_SIDE else 'VIOLATION'}"

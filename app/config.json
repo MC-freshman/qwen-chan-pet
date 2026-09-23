@@ -19,7 +19,7 @@
   "long_work_minutes": 90,
   "idle_user_seconds": 180,
   "allow_clipboard": false,
-  "hi_res_timer": false,
+  "hi_res_timer": true,
   "cycle_seconds": {
     "idle": 4.0,
     "running-right": 0.85,

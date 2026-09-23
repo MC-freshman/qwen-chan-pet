@@ -154,14 +154,24 @@ def band_scale_fast(image: Image.Image, top: float, bottom: float, factor: float
     return out
 
 
-def scale_about(image: Image.Image, factor: float, anchor_row: float) -> Image.Image:
-    """Stretch or squash the whole cell about one row - landing keeps her feet planted."""
-    if abs(factor - 1.0) < 1e-4:
+def squash_stretch(image: Image.Image, vertical: float, anchor_row: float, bulge: float = 0.6) -> Image.Image:
+    """Squash or stretch about one row, with the body bulging sideways to match.
+
+    A vertical-only squash reads as a rubber sheet: she just gets shorter. Real
+    weight-shifting also widens her, so the horizontal factor is derived from the
+    vertical one at `bulge` of the volume-preserving amount.
+    """
+    if abs(vertical - 1.0) < 1e-4:
         return image
+    fx = 1.0 + (1.0 / vertical - 1.0) * bulge
+    cx = image.width / 2.0
     return image.transform(
         (image.width, image.height),
         Image.Transform.AFFINE,
-        (1.0, 0.0, 0.0, 0.0, 1.0 / factor, anchor_row - anchor_row / factor),
+        (
+            1.0 / fx, 0.0, cx - cx / fx,
+            0.0, 1.0 / vertical, anchor_row - anchor_row / vertical,
+        ),
         resample=Image.Resampling.BILINEAR,
         fillcolor=(0, 0, 0, 0),
     )
@@ -261,11 +271,43 @@ class LifeLayer:
         self.eye_row = eye_row
         self.chin_row = chin_row
 
-    def _blink(self, now: float) -> float:
+    def offsets(self, height: int, now: float) -> np.ndarray:
+        """Sway and any deliberate turn, added into one per-row profile.
+
+        Every horizontal runtime effect - sway, gaze, turn, the lean from a throw - is
+        a per-row shift, so the pet sums them and shears once instead of once each.
+        Three gathers at 269x291 cost ~5ms; one costs 1.7ms.
+        """
+        unit = height / 208.0
+        t = now - self.t0
+        sway = (
+            0.60 * math.sin(t * 0.90 + self.phase)
+            + 0.29 * math.sin(t * 0.37 + 0.4)
+            + 0.11 * math.sin(t * 1.73 + 1.1)
+        ) * 2.4 * unit
+        profile = simple_pendulum(height, height * 0.66, sway, rigid_above=height * 0.30)
+        turn = self._turn(now, unit)
+        if turn:
+            profile = profile + head_follow_profile(
+                height, self.chin_row, turn, shoulder=26.0 * unit
+            )
+        return profile
+
+    def breath(self, now: float) -> float:
+        t = now - self.t0
+        return 1.0 + 0.012 * math.sin(t * (math.tau / 3.9) + self.phase) + 0.004 * math.sin(t * 0.21)
+
+    def blink(self, now: float) -> float:
         if now >= self.next_blink:
             self.blink_until = now + 0.09
             self.next_blink = now + self.random.uniform(2.2, 7.5)
         return 0.55 if now < self.blink_until else 1.0
+
+    def blink_band(self, height: int) -> tuple[float, float] | None:
+        if self.eye_row is None:
+            return None
+        unit = height / 208.0
+        return (self.eye_row - 6.0 * unit, self.eye_row + 8.0 * unit)
 
     def _turn(self, now: float, unit: float) -> float:
         """Envelope-shaped head turn: eases out and back, never a step."""
@@ -278,31 +320,6 @@ class LifeLayer:
             return 0.0
         progress = (now - self.turn_from) / (self.turn_until - self.turn_from)
         return self.turn_dir * 2.6 * unit * math.sin(math.pi * progress)
-
-    def apply(self, cell: Image.Image, now: float) -> Image.Image:
-        unit = cell.height / 208.0
-        height = cell.height
-        t = now - self.t0
-        sway = (
-            0.60 * math.sin(t * 0.90 + self.phase)
-            + 0.29 * math.sin(t * 0.37 + 0.4)
-            + 0.11 * math.sin(t * 1.73 + 1.1)
-        ) * 2.4 * unit
-        image = shear_rows_fast(
-            cell,
-            simple_pendulum(height, height * 0.66, sway, rigid_above=height * 0.30),
-        )
-        breath = 1.0 + 0.012 * math.sin(t * (math.tau / 3.9) + self.phase) + 0.004 * math.sin(t * 0.21)
-        image = band_scale_fast(image, height * 0.36, height * 0.68, breath)
-        blink = self._blink(now)
-        if blink != 1.0 and self.eye_row is not None:
-            image = band_scale_fast(image, self.eye_row - 6.0 * unit, self.eye_row + 8.0 * unit, blink)
-        turn = self._turn(now, unit)
-        if turn:
-            image = shear_rows_fast(
-                image, head_follow_profile(height, self.chin_row, turn, shoulder=26.0 * unit)
-            )
-        return image
 
 
 class Spring:
