@@ -19,5 +19,16 @@
   "long_work_minutes": 90,
   "idle_user_seconds": 180,
   "allow_clipboard": false,
-  "hi_res_timer": false
+  "hi_res_timer": false,
+  "cycle_seconds": {
+    "idle": 4.0,
+    "running-right": 0.85,
+    "running-left": 0.85,
+    "waving": 1.25,
+    "jumping": 1.1,
+    "failed": 3.6,
+    "waiting": 3.8,
+    "running": 0.9,
+    "review": 3.2
+  }
 }

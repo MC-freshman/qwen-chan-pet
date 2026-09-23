@@ -183,8 +183,19 @@ def fit(image: Image.Image, height: int, max_width: int = FRAME_W - 6) -> Image.
     return image.resize(size, Image.Resampling.LANCZOS)
 
 
-def transform(image: Image.Image, dx: int, dy: int, tilt: float, squash: float) -> Image.Image:
-    """Squash and rotate on a padded layer so the sprite canvas never cuts hair or fan."""
+def transform(
+    image: Image.Image,
+    dx: int,
+    dy: int,
+    tilt: float,
+    squash: float,
+    pad: int = PAD,
+    foot: int = 6,
+) -> Image.Image:
+    """Squash and rotate on a padded layer so the sprite canvas never cuts hair or fan.
+
+    pad/foot are cell pixels, so a caller rendering at 2x the sheet passes 2x of each.
+    """
     w, h = image.size
     src = image
     if squash:
@@ -193,21 +204,20 @@ def transform(image: Image.Image, dx: int, dy: int, tilt: float, squash: float) 
         stretched = src.resize((nw, nh), Image.Resampling.LANCZOS)
         src = Image.new("RGBA", (w, h), (0, 0, 0, 0))
         src.alpha_composite(stretched, ((w - nw) // 2, h - nh))
-    layer = Image.new("RGBA", (w + PAD * 2, h + PAD * 2), (0, 0, 0, 0))
-    layer.alpha_composite(src, (PAD, PAD))
+    layer = Image.new("RGBA", (w + pad * 2, h + pad * 2), (0, 0, 0, 0))
+    layer.alpha_composite(src, (pad, pad))
     if tilt:
         layer = layer.rotate(
             tilt,
             resample=Image.Resampling.BICUBIC,
-            center=(PAD + w // 2 + dx, PAD + h - 6),
+            center=(pad + w // 2 + dx, pad + h - foot),
         )
     return layer
 
 
-def draw_charm(swing: float, droop: float = 0.0) -> Image.Image:
+def draw_charm(swing: float, droop: float = 0.0, size: int = 64) -> Image.Image:
     """Qwen six-petal emblem on a short chain, drawn oversized then downscaled."""
     ss = 4
-    size = 64
     layer = Image.new("RGBA", (size * ss, size * ss), (0, 0, 0, 0))
     d = ImageDraw.Draw(layer)
     cx = size * ss // 2

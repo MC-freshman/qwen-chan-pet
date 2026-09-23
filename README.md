@@ -54,7 +54,8 @@ powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 
 `follow_qoder` 是否吸附 Qoder 窗口右下角并跟随移动 · `perch_offset` 吸附偏移 ·
 `wander_range` 跑动范围 · `speech_min_gap_seconds` / `speech_max_per_hour` 说话节流 ·
-`quiet_hours` 静默时段 · `watchdog_grace_seconds` 退出宽限 · `long_work_minutes` 连续工作提醒阈值
+`quiet_hours` 静默时段 · `watchdog_grace_seconds` 退出宽限 · `long_work_minutes` 连续工作提醒阈值 ·
+`cycle_seconds` 每个状态**一跳多少秒**（播放时长属于动作本身，不属于帧数）
 
 ## 动效是怎么来的
 
@@ -83,16 +84,23 @@ powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 
 | | 数值 |
 | --- | --- |
-| 帧数 | 114 帧 / 9 状态（每状态 8–16 帧，原先 57） |
-| 播放 | 目标 20fps，实测 15.7fps（Windows 定时器粒度 15.6ms，`after(50)` 落到 62.5ms） |
+| 帧数 | 172 帧 / 9 状态（每状态 16–24 帧） |
+| 出帧分辨率 | 384×416 渲染，Qoder 包降采样回 192×208 契约格 |
+| 播放 | 按墙钟取帧，一跳多长来自 `cycle_seconds`；显示帧率目标 20fps、实测 15.7fps（Windows 定时器粒度 15.6ms，`after(50)` 落到 62.5ms） |
 | 常驻开销 | 约 4.7% 单核；帧按状态懒加载，只保留最近 4 个状态 |
 | 想要真 20fps | `config.json` 里 `hi_res_timer: true`（调 `timeBeginPeriod(1)`，会改变全系统定时器精度，故默认关） |
+
+两个行映射原语各有两版：`shear_rows` / `band_scale` 是逐像素精确版，出帧时用；
+`shear_rows_fast` / `band_scale_fast` 是**分段仿射版**，运行时用——按剖面的拐点切段，
+每段交给 Pillow 在 C 里做一次仿射重采样。269×291 的格子上，三原语一帧从 22.9ms 降到
+6.2ms（占单核约 10%），拐点没切准就会在头发上留下一行接缝，所以 `_band_edges` 里
+"拐点 + 至少 3 行一段"这两条是硬要求，不是优化口味。
 
 ## 素材管线
 
 ```
-poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠物，全帧率）
-                                  →  out/spritesheet.webp      （Qoder 包，每行降采样到 8 帧）
+poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠物，384×416、全帧率、不含挂饰）
+                                  →  out/spritesheet.webp      （Qoder 包，192×208 契约格、每行 8 帧、保留挂饰）
 ```
 
 `build_motion.py` 复用 `build_qwen_spritesheet.py` 的去背、安全区与姿态编排，两者共用同一份素材源。

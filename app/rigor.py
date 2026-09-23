@@ -2,6 +2,12 @@
 
 Everything that makes the sprite feel alive is expressed as a per-row horizontal
 shift (secondary motion, gaze) or a per-row vertical resample (blink, breathing).
+
+Each primitive ships in two versions. The numpy gather is exact and is what the
+frame build uses offline. The piecewise-affine one is ~6x cheaper (1.7ms vs 9.5ms
+on a 269x291 cell) because Pillow does the resampling in C, and is what the running
+pet uses every frame: our profiles are piecewise linear anyway, so splitting at
+their kinks makes the approximation near-exact.
 """
 
 from __future__ import annotations
@@ -57,6 +63,91 @@ def band_scale(image: Image.Image, top: float, bottom: float, factor: float) -> 
     b = arr[y1].astype(np.int16)
     out = np.clip(a + (b - a) * blend, 0, 255).astype(np.uint8)
     return Image.fromarray(_alpha_composite_zero(out), "RGBA")
+
+
+def _profile(height: int, offsets) -> np.ndarray:
+    off = np.zeros(height, dtype=float)
+    flat = np.asarray(offsets, dtype=float).ravel()
+    off[: min(height, flat.size)] = flat[: min(height, flat.size)]
+    return off
+
+
+def _band_edges(off: np.ndarray, max_bands: int) -> list[int]:
+    """Split the profile where its slope changes, so every run is near-linear.
+
+    simple_pendulum and head_follow_profile are exactly piecewise linear, so cutting
+    at their kinks makes each band's chord the profile itself. A band that straddles
+    a kink instead shears the head by up to half the swing, which is why this looks
+    for slope *changes* and not just sign flips.
+    """
+    height = off.size
+    slope = np.diff(off)
+    change = np.abs(np.diff(slope))
+    kinks = np.flatnonzero(change > 0.05) + 1
+    budget = max(0, max_bands - 3)
+    if kinks.size > budget:
+        kinks = kinks[np.argsort(-change[kinks - 1])[:budget]]
+    edges = np.unique(np.concatenate([
+        np.linspace(0, height, max(2, min(max_bands, 3 + kinks.size)) + 1).astype(int),
+        kinks,
+        [0, height],
+    ]))
+    # A band narrower than a couple of rows gets skipped by the loop below, and a
+    # skipped row inside the head is a visible one-row seam - merge them away.
+    kept: list[int] = []
+    for edge in (int(e) for e in edges):
+        if not kept or edge - kept[-1] >= 3:
+            kept.append(edge)
+        else:
+            kept[-1] = max(kept[-1], edge)
+    if kept[-1] != height:
+        if height - kept[-1] < 3 and len(kept) > 1:
+            kept.pop()
+        kept.append(height)
+    return kept
+
+
+def shear_rows_fast(image: Image.Image, offsets, max_bands: int = 12) -> Image.Image:
+    """shear_rows for the running pet: one C-level affine resample per linear run."""
+    height, width = image.height, image.width
+    off = _profile(height, offsets)
+    out = image.copy()
+    edges = _band_edges(off, max_bands)
+    for y0, y1 in zip(edges[:-1], edges[1:]):
+        if y1 - y0 < 2:
+            continue
+        a, b = off[y0], off[y1 - 1]
+        if abs(a) < 0.01 and abs(b) < 0.01:
+            continue  # already in place; copying is the identity
+        slope = (b - a) / (y1 - 1 - y0) if y1 - 1 > y0 else 0.0
+        band = image.transform(
+            (width, y1 - y0),
+            Image.Transform.AFFINE,
+            (1.0, -slope, -a, 0.0, 1.0, y0),
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=(0, 0, 0, 0),
+        )
+        out.paste(band, (0, y0))
+    return out
+
+
+def band_scale_fast(image: Image.Image, top: float, bottom: float, factor: float) -> Image.Image:
+    """band_scale for the running pet: a single vertical affine over the band."""
+    height, width = image.height, image.width
+    top_i, bottom_i = max(0, int(top)), min(height, int(bottom))
+    if bottom_i - top_i < 2 or factor <= 0 or abs(factor - 1.0) < 1e-4:
+        return image
+    centre = (top_i + bottom_i) / 2.0
+    band = image.transform(
+        (width, bottom_i - top_i),
+        Image.Transform.AFFINE,
+        (1.0, 0.0, 0.0, 0.0, 1.0 / factor, centre + (top_i - centre) / factor),
+        resample=Image.Resampling.BILINEAR,
+        fillcolor=(0, 0, 0, 0),
+    )
+    out = image.copy()
+    out.paste(band, (0, top_i))
+    return out
 
 
 def simple_pendulum(height: int, pivot: float, amp: float, rigid_above: float | None = None) -> np.ndarray:

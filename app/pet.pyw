@@ -25,7 +25,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 APP = Path(__file__).resolve().parent
 SHEET = APP / "assets" / "spritesheet.webp"
 FRAMES_DIR = APP / "frames"
-CELL_W, CELL_H = 192, 208
+# The Qoder package sheet is 8 columns x 9 rows of 192x208. app/frames/ holds the
+# same states at a higher render resolution, so the cell size comes from disk.
+SHEET_CELL = (192, 208)
+SHEET_CELLS = 8
+DISPLAY_BASE = (192, 208)  # what one sheet cell is worth on screen at scale 1.0
 ROW_STATES = [
     "idle",
     "running-right",
@@ -37,18 +41,14 @@ ROW_STATES = [
     "running",
     "review",
 ]
-FRAME_COUNTS = {
-    "idle": 6,
-    "running-right": 8,
-    "running-left": 8,
-    "waving": 4,
-    "jumping": 5,
-    "failed": 8,
-    "waiting": 6,
-    "running": 6,
-    "review": 6,
-}
+MIRROR_PAIR = {"running-right": "running-left", "running-left": "running-right"}
+DEFAULT_CYCLE = 2.0
+PHOTO_CACHE = 420
 MAGIC = "#ff00fe"
+# A key-colour window cannot blend, so the silhouette edge is hardened to 0/255.
+# As a 256-entry table: Image.point with a Python lambda costs a callback per pixel,
+# which was most of the frame time.
+HARD_ALPHA = [0 if v < 128 else 255 for v in range(256)]
 BUBBLE_FONT = "C:/Windows/Fonts/msyh.ttc"
 FAST_TICK = 0.05
 SLOW_TICK = 1.0
@@ -163,7 +163,8 @@ class Pet:
         self.x = 0.0
         self.y = 0.0
         self.state = "idle"
-        self.frame_i = 0
+        self.state_started = time.time()
+        self.last_frame = time.time()
         self.state_until = 0.0
         self.forced_state: str | None = None
         self.forced_until = 0.0
@@ -217,49 +218,60 @@ class Pet:
         self.cfg["scale"] = round(max(0.45, min(1.6, scale)), 2)
         self.pixel_scale = self.cfg["scale"] * self.dpi
         self.frame_size = (
-            max(1, round(CELL_W * self.pixel_scale)),
-            max(1, round(CELL_H * self.pixel_scale)),
+            max(1, round(DISPLAY_BASE[0] * self.pixel_scale)),
+            max(1, round(DISPLAY_BASE[1] * self.pixel_scale)),
         )
         self.cells: dict[str, list[Image.Image]] = {}
         self.head: dict[str, tuple[float, float]] = {}
         self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
-        self.sheet = None if FRAMES_DIR.is_dir() else Image.open(SHEET).convert("RGBA")
+        self.sheet: Image.Image | None = None
         rig_file = FRAMES_DIR / "rig.json"
-        self.chin = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
+        self.rig = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
+        self.cycles = self.cfg.get("cycle_seconds") or {}
 
-    def prepare(self, image: Image.Image) -> Image.Image:
+    def sheet_image(self) -> Image.Image:
+        """Opened on demand: app/frames/ can be missing or mid-rebuild, and the
+        sheet is the fallback for exactly those moments."""
+        if self.sheet is None:
+            self.sheet = Image.open(SHEET).convert("RGBA")
+        return self.sheet
+
+    def prepare(self, image: Image.Image, charm_free: bool) -> Image.Image:
         cell = image.resize(self.frame_size, Image.Resampling.LANCZOS)
-        # The sheet's charm hangs from the cell top, which has no ceiling here;
-        # it now dangles from the speech bubble instead. Drop it by detachment, not
-        # by a fixed box: it swings and droops per state, so a box either leaves a
-        # sliver on the "failed" row or clips her hat.
-        cell = rigor.drop_detached(cell, round(cell.height * 0.24), round(cell.width * 0.38))
+        # The sheet's charm hangs from the cell top, which has no ceiling here; it now
+        # dangles from the speech bubble instead. app/frames/ ships without it, so
+        # only the sheet path pays for finding and dropping it.
+        if not charm_free:
+            cell = rigor.drop_detached(cell, round(cell.height * 0.24), round(cell.width * 0.38))
         # A key-colour window cannot blend, so harden the silhouette edge.
-        cell.putalpha(cell.getchannel("A").point(lambda v: 255 if v >= 128 else 0))
+        cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         return cell
 
     def load_state(self, state: str) -> list[Image.Image]:
-        """Frames are ~5MB per state, so keep only the few most recent resident."""
+        """Frames are ~10MB per state, so keep only the few most recent resident."""
         cached = self.cells.get(state)
         if cached:
             return cached
         folder = FRAMES_DIR / state
-        if folder.is_dir():
-            raw = [Image.open(path) for path in sorted(folder.glob("*.png"))]
+        files = sorted(folder.glob("*.png")) if folder.is_dir() else []
+        if files:
+            raw = [Image.open(path) for path in files]
+            charm_free = True
         else:
-            row = ROW_STATES.index(state)
+            row = ROW_STATES.index(state) * SHEET_CELL[1]
             raw = [
-                self.sheet.crop(
+                self.sheet_image().crop(
                     (
-                        col * CELL_W,
-                        row * CELL_H,
-                        (col + 1) * CELL_W,
-                        (row + 1) * CELL_H,
+                        col * SHEET_CELL[0],
+                        row,
+                        (col + 1) * SHEET_CELL[0],
+                        row + SHEET_CELL[1],
                     )
                 )
-                for col in range(FRAME_COUNTS[state])
+                for col in range(SHEET_CELLS)
             ]
-        cells = [self.prepare(image) for image in raw]
+            charm_free = False
+        cells = [self.prepare(image, charm_free) for image in raw]
         self.head[state] = head_anchor(cells[0])
         self.cells[state] = cells
         for other in list(self.cells):
@@ -267,6 +279,7 @@ class Pet:
                 break
             if other != state:
                 del self.cells[other]
+                self.head.pop(other, None)
         return cells
 
     def render(self, state: str, index: int, gaze: int) -> ImageTk.PhotoImage:
@@ -278,19 +291,22 @@ class Pet:
         cell = cells[index % len(cells)]
         if gaze:
             hx, hy = self.head[state]
-            # Ramp from the chin down: the hat sits in the rigid zone above it, so a
-            # misread face line cannot streak the brim the way a 14px neck band did.
-            chin = (self.chin.get(state) or {}).get("chin") or hy + cell.height * 0.24
-            cell = rigor.shear_rows(
-                cell, rigor.head_follow_profile(cell.height, chin, gaze * 2.2, shoulder=26.0)
+            # Gaze landmarks are stored as fractions of the cell, and the pixel
+            # bands below are authored against a 208px cell, so both scale here.
+            unit = cell.height / DISPLAY_BASE[1]
+            chin_row = (self.rig.get(state) or {}).get("chin")
+            chin = chin_row * cell.height if chin_row else hy + cell.height * 0.24
+            cell = rigor.shear_rows_fast(
+                cell, rigor.head_follow_profile(cell.height, chin, gaze * 2.2 * unit, shoulder=26.0 * unit)
             )
-            cell.putalpha(cell.getchannel("A").point(lambda v: 255 if v >= 128 else 0))
+            cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         flat = Image.new("RGB", cell.size, (255, 0, 254))
         flat.paste(cell, (0, 0), cell)
         photo = ImageTk.PhotoImage(flat)
-        if len(self.photos) > 150:
-            self.photos.clear()
         self.photos[key] = photo
+        while len(self.photos) > PHOTO_CACHE:
+            self.photos.pop(next(iter(self.photos)))  # oldest first: dropping them all
+            # at once costs a full repaint pass and shows up as a hitch.
         return photo
 
     def bind_events(self) -> None:
@@ -334,20 +350,30 @@ class Pet:
         return title, winutil.foreground_file(title)
 
     def animate(self, now: float) -> None:
+        dt = max(0.0, min(0.25, now - self.last_frame))
+        self.last_frame = now
         if now >= self.state_until:
-            self.state = self.choose_state(now)
-            self.frame_i = 0
-            self.state_until = now + self.dwell(self.state)
-        self.frame_i += 1
-        self.move(now)
+            self.enter_state(self.choose_state(now), now)
+        self.move(now, dt)
         self.update_gaze(now)
         cells = self.load_state(self.state)
-        photo = self.render(self.state, self.frame_i % len(cells), self.gaze)
+        # Time-driven playback: how long a loop lasts belongs to the action, not to
+        # the frame count or to how often Tk happens to wake us. Waving used to run
+        # its 8 frames at whatever the tick was, which read as a 0.5s shiver.
+        cycle = self.cycles.get(self.state, DEFAULT_CYCLE)
+        index = int((now - self.state_started) / cycle * len(cells)) % len(cells)
+        photo = self.render(self.state, index, self.gaze)
         self.label.configure(image=photo)
         self.image = photo
         self.place()
         if self.bubble is not None:
             self.position_bubble()
+
+    def enter_state(self, state: str, now: float) -> None:
+        if MIRROR_PAIR.get(self.state) != state:
+            self.state_started = now  # 跑到边界掉头时沿用步幅相位，不重新起步
+        self.state = state
+        self.state_until = now + self.dwell(state)
 
     def update_gaze(self, now: float) -> None:
         """She turns her head toward the cursor, and stops when nobody is around."""
@@ -369,20 +395,23 @@ class Pet:
             return self.rng.uniform(1.2, 2.0)
         return self.rng.uniform(3.0, 7.0)
 
-    def move(self, now: float) -> None:
+    def move(self, now: float, dt: float) -> None:
         if self.drag_anchor is not None:
             return
+        step = 64.0 * dt * self.pixel_scale  # what 3.2 px per 50ms tick meant at 20fps
         if self.state == "running-right":
-            self.x += 3.2 * self.pixel_scale
+            self.x += step
         elif self.state == "running-left":
-            self.x -= 3.2 * self.pixel_scale
+            self.x -= step
         elif not self.pinned:
-            self.x += (self.anchor - self.x) * 0.06
-            self.y += (self.floor - self.y) * 0.2
+            # Per-second rates, so the glide back to the perch is the same speed no
+            # matter how often Tk wakes us.
+            self.x += (self.anchor - self.x) * (1.0 - math.exp(-1.23 * dt))
+            self.y += (self.floor - self.y) * (1.0 - math.exp(-4.46 * dt))
         limit = self.cfg["wander_range"] * self.pixel_scale
         if self.x > self.anchor + limit:
             if self.state != "running-left":
-                self.state = "running-left"   # 不重置 frame_i：越界会持续多个 tick
+                self.state = "running-left"   # 不切 enter_state：越界会持续多个 tick
         elif self.x < self.anchor - limit:
             if self.state != "running-right":
                 self.state = "running-right"
@@ -422,7 +451,8 @@ class Pet:
     def force(self, state: str, seconds: float = 1.5) -> None:
         self.forced_state = state
         self.forced_until = time.time() + seconds
-        self.state, self.frame_i = state, 0
+        self.state = state
+        self.state_started = time.time()
         self.state_until = self.forced_until
 
     # ---------- fullscreen courtesy ----------
