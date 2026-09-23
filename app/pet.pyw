@@ -15,6 +15,8 @@ import tkinter as tk
 from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
+
 import rigor
 import winutil
 from needs import Life, write_diary
@@ -131,8 +133,6 @@ def render_bubble(text: str, scale: float, swing: float = 0.0) -> tuple[Image.Im
 
 def head_anchor(cell: Image.Image) -> tuple[float, float]:
     """Where her head sits inside a cell, so the bubble tail points at her and not at empty space."""
-    import numpy as np
-
     mask = np.array(cell.getchannel("A"), dtype=np.uint8).copy()
     mask[: round(cell.height * 0.21), : round(cell.width * 0.27)] = 0  # the charm, not her
     ys, xs = np.nonzero(mask)
@@ -148,6 +148,7 @@ class Pet:
         self.cfg = config
         self.life = Life(APP / "save.json")
         self.rng = random.Random()
+        self.layer = rigor.LifeLayer(self.rng)
         self.speech = Speech(APP / "lines" / "zh.json", self.life, self.rng)
         self.lock = self.acquire_lock()
 
@@ -189,6 +190,22 @@ class Pet:
         self.gaze = 0
         self.last_gaze = 0.0
         self.session_start = time.time()
+        self.offline_gap = 0.0
+        # mouse conversation and the small physics she obeys when thrown
+        self.press_at = 0.0
+        self.press_zone: str | None = None
+        self.long_press_id = None
+        self.drag_trace: list[tuple[float, int, int]] = []
+        self.velocity = (0.0, 0.0)
+        self.airborne = False
+        self.squash = 0.0
+        self.lean = 0.0
+        self.tickle_until = 0.0
+        self.touches: list[float] = []
+        self.pointer_on_her_since = 0.0
+        self.last_watched = 0.0
+        self.swallow_release = False
+        self.current: Image.Image | None = None
         self.next_slow = 0.0
         self.next_save = self.session_start + self.cfg["save_every_seconds"]
         self.next_speech = self.session_start + self.rng.uniform(12, 24)
@@ -228,7 +245,6 @@ class Pet:
         self.cells: dict[str, list[Image.Image]] = {}
         self.head: dict[str, tuple[float, float]] = {}
         self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
-        self.layer = rigor.LifeLayer(self.rng)
         self.sheet: Image.Image | None = None
         rig_file = FRAMES_DIR / "rig.json"
         self.rig = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
@@ -294,6 +310,8 @@ class Pet:
         if live is None:
             photo = self.photos.get(key)
             if photo is not None:
+                # keep the silhouette we test clicks against in step with what is drawn
+                self.current = self.cells[state][index % len(self.cells[state])]
                 return photo
         cells = self.load_state(state)
         cell = cells[index % len(cells)]
@@ -309,8 +327,16 @@ class Pet:
             )
         if live is not None:
             cell = self.layer.apply(cell, live)
-        if gaze or live is not None:
+        if self.squash or self.lean:
+            # Landing compresses her from the feet up; a throw leans the whole body.
+            cell = rigor.scale_about(cell, 1.0 - self.squash, cell.height - 1)
+            if abs(self.lean) > 0.05:
+                cell = rigor.shear_rows_fast(
+                    cell, rigor.simple_pendulum(cell.height, cell.height * 0.92, self.lean)
+                )
+        if gaze or live is not None or self.squash or self.lean:
             cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
+        self.current = cell
         flat = Image.new("RGB", cell.size, (255, 0, 254))
         flat.paste(cell, (0, 0), cell)
         photo = ImageTk.PhotoImage(flat)
@@ -339,6 +365,7 @@ class Pet:
         self.label.bind("<Double-Button-1>", self.on_feed)
         self.label.bind("<Button-3>", self.on_menu)
         self.label.bind("<MouseWheel>", self.on_wheel)
+        self.label.bind("<Motion>", self.on_hover)
 
     # ---------- main loop ----------
 
@@ -362,6 +389,7 @@ class Pet:
             self.qoder_hwnd = hwnd or 0
             self.refresh_perch(hwnd)
             self.life.note_context(*self.foreground())
+            self.check_hover(now)
             if self.check_qoder(now, hwnd):
                 return
         self.schedule_speech(now)
@@ -377,6 +405,7 @@ class Pet:
         self.last_frame = now
         if now >= self.state_until:
             self.enter_state(self.choose_state(now), now)
+        self.physics(dt)
         self.move(now, dt)
         self.update_gaze(now)
         cells = self.load_state(self.state)
@@ -385,8 +414,14 @@ class Pet:
         # its 8 frames at whatever the tick was, which read as a 0.5s shiver.
         cycle = self.cycles.get(self.state, DEFAULT_CYCLE)
         index = int((now - self.state_started) / cycle * len(cells)) % len(cells)
-        photo = self.render(self.state, index, self.gaze,
-                            live=now if self.state in CALM_STATES else None)
+        moving = (
+            self.state in CALM_STATES
+            or self.airborne
+            or now < self.tickle_until
+            or abs(self.squash) > 0.004
+            or abs(self.lean) > 0.05
+        )
+        photo = self.render(self.state, index, self.gaze, live=now if moving else None)
         self.label.configure(image=photo)
         self.image = photo
         self.place()
@@ -421,8 +456,8 @@ class Pet:
         return self.rng.uniform(3.0, 7.0)
 
     def move(self, now: float, dt: float) -> None:
-        if self.drag_anchor is not None:
-            return
+        if self.drag_anchor is not None or self.airborne:
+            return  # physics owns her position while she is in the air
         step = 64.0 * dt * self.pixel_scale  # what 3.2 px per 50ms tick meant at 20fps
         if self.state == "running-right":
             self.x += step
@@ -659,9 +694,70 @@ class Pet:
 
     # ---------- interaction ----------
 
+    def zone_at(self, x: int, y: int) -> str | None:
+        """Which part of her the pointer landed on; None if it hit the empty air beside her."""
+        cell = self.current
+        if cell is None or not (0 <= x < cell.width and 0 <= y < cell.height):
+            return None
+        if cell.getpixel((x, y))[3] < 128:
+            return None
+        height = cell.height
+        spec = self.rig.get(self.state) or {}
+        eye = (spec.get("eye") or 0.39) * height
+        chin = (spec.get("chin") or 0.46) * height
+        if y < eye - height * 0.05:
+            return "hat"
+        if y < chin + height * 0.03:
+            return "face"
+        # Hair is whatever hangs off the edge of her silhouette, which moves with the
+        # pose - a fixed fraction of the cell missed the strands entirely while waving.
+        if y < height * 0.74:
+            strip = np.asarray(cell.crop((0, y, cell.width, y + 1)).getchannel("A")) > 128
+            span = np.flatnonzero(strip)
+            edge = height * 0.06
+            if span.size and (x <= span[0] + edge or x >= span[-1] - edge):
+                return "hair"
+        if y > height * 0.62:
+            return "skirt"
+        return "body"
+
+    def on_hover(self, event) -> None:
+        """She notices a pointer that parks on her; the slow tick decides if it stayed."""
+        if self.zone_at(event.x, event.y) is None:
+            self.pointer_on_her_since = 0.0
+        elif not self.pointer_on_her_since:
+            self.pointer_on_her_since = time.time()
+
     def on_press(self, event) -> None:
+        self.press_at = time.time()
+        self.press_zone = self.zone_at(event.x, event.y)
         self.drag_anchor = (event.x_root - int(self.x), event.y_root - int(self.y))
+        self.drag_trace = [(self.press_at, event.x_root, event.y_root)]
         self.moved = 0
+        self.airborne = False
+        self.velocity = (0.0, 0.0)
+        self.cancel_long_press()
+        self.long_press_id = self.root.after(450, self.on_long_press)
+
+    def cancel_long_press(self) -> None:
+        if self.long_press_id is not None:
+            self.root.after_cancel(self.long_press_id)
+            self.long_press_id = None
+
+    def on_long_press(self) -> None:
+        """Holding still against her is tickling, which is not the same as petting."""
+        self.long_press_id = None
+        if self.drag_anchor is None or self.moved > 2 or self.press_zone is None:
+            return
+        self.tickle()
+
+    def tickle(self) -> None:
+        self.tickle_until = time.time() + 0.9
+        self.life.sleeping = False
+        self.life.bump("mood", 3.0)
+        self.life.bump("affection", 1.5)
+        self.force("jumping", 0.9)
+        self.say(self.speech.pick("touch", "tickle", **self.line_vars()))
 
     def on_drag(self, event) -> None:
         if self.drag_anchor is None:
@@ -669,13 +765,26 @@ class Pet:
         self.x = event.x_root - self.drag_anchor[0]
         self.y = event.y_root - self.drag_anchor[1]
         self.moved += 1
+        now = time.time()
+        self.drag_trace.append((now, event.x_root, event.y_root))
+        self.drag_trace = [sample for sample in self.drag_trace if now - sample[0] < 0.2]
         self.place()
 
     def on_release(self, event) -> None:
+        self.cancel_long_press()
+        if self.swallow_release:
+            self.swallow_release = False
+            self.drag_anchor = None
+            return
         dragged = self.moved > 3
         self.drag_anchor = None
         if not dragged:
-            self.on_pet()
+            if self.press_zone is not None:
+                self.on_pet(self.press_zone)
+            return
+        velocity_x, velocity_y = self.throw_velocity()
+        if abs(velocity_x) > 320 or abs(velocity_y) > 320:
+            self.throw(velocity_x, velocity_y)
             return
         self.pinned = True
         self.anchor, self.floor = self.x, self.y
@@ -684,19 +793,91 @@ class Pet:
         self.force("waving", 1.2)
         self.say(self.speech.pick("touch", "drag", **self.line_vars()))
 
-    def on_pet(self) -> None:
+    def throw_velocity(self) -> tuple[float, float]:
+        samples = self.drag_trace
+        if len(samples) < 2:
+            return 0.0, 0.0
+        first, last = samples[0], samples[-1]
+        span = last[0] - first[0]
+        if span < 0.02:
+            return 0.0, 0.0
+        return (last[1] - first[1]) / span, (last[2] - first[2]) / span
+
+    def throw(self, velocity_x: float, velocity_y: float) -> None:
+        self.pinned = True
+        self.airborne = True
+        self.velocity = (velocity_x, velocity_y)
+        self.life.stats["drags"] += 1
+        self.life.bump("mood", -1.0)
+        self.life.bump("curiosity", 2.0)
+        self.say(self.speech.pick("touch", "thrown", **self.line_vars()))
+
+    def physics(self, dt: float) -> None:
+        """Gravity, a bounce or two, and a squash from the feet up when she lands."""
+        self.squash *= math.exp(-dt * 9.0)
+        self.lean *= math.exp(-dt * 5.0)
+        now = time.time()
+        if now < self.tickle_until:
+            unit = self.frame_size[1] / DISPLAY_BASE[1]
+            self.lean = math.sin(now * 22.0) * 5.0 * unit
+        if not self.airborne:
+            return
+        left, _top, right, bottom = winutil.work_area()
+        floor = float(bottom - self.frame_size[1])
+        velocity_x, velocity_y = self.velocity
+        self.velocity = (velocity_x * math.exp(-dt * 0.7), velocity_y + 2400.0 * dt)
+        self.x += self.velocity[0] * dt
+        self.y += self.velocity[1] * dt
+        self.lean = max(-12.0, min(12.0, -self.velocity[0] * 0.012))
+        if self.y >= floor:
+            self.y = floor
+            impact = abs(velocity_y)
+            self.squash = min(0.16, impact / 9000.0)
+            self.velocity = (self.velocity[0] * 0.55, -impact * 0.34)
+            if impact > 700:
+                self.say(self.speech.pick("touch", "landed", **self.line_vars()))
+            if abs(self.velocity[1]) < 130:
+                self.land()
+        wall_left, wall_right = left - 30, right - self.frame_size[0] + 30
+        if self.x < wall_left or self.x > wall_right:
+            self.x = max(wall_left, min(wall_right, self.x))
+            self.velocity = (-self.velocity[0] * 0.4, self.velocity[1])
+
+    def land(self) -> None:
+        self.airborne = False
+        self.velocity = (0.0, 0.0)
+        self.anchor, self.floor = self.x, self.y
+
+    def on_pet(self, zone: str = "body") -> None:
+        now = time.time()
+        self.touches = [touched for touched in self.touches if now - touched < 3.0]
+        self.touches.append(now)
+        streak = len(self.touches)
         self.life.stats["pets"] += 1
-        self.life.bump("affection", 4.0)
-        self.life.bump("mood", 2.0)
         self.life.sleeping = False
+        if streak >= 6:
+            self.life.bump("mood", -1.5)
+            self.life.bump("affection", 0.5)
+            self.force("failed", 1.4)
+            self.say(self.speech.pick("touch", "annoyed", **self.line_vars()))
+            return
         if self.life.needs["mood"] < 30:
             self.force("failed", 1.4)
             self.say(self.speech.pick("touch", "reject", **self.line_vars()))
             return
+        # the fifth pat in a row is worth less than the first
+        gain = 1.0 if streak <= 2 else 0.5
+        self.life.bump("affection", 4.0 * gain)
+        self.life.bump("mood", 2.0 * gain)
+        self.life.bump("curiosity", 1.0)
+        if zone == "hat":
+            self.lean = 6.0 * (self.frame_size[1] / DISPLAY_BASE[1])
         self.force("waving", 1.4)
-        self.say(self.speech.pick("touch", "pet", **self.line_vars()))
+        self.say(self.speech.pick("touch", zone) or self.speech.pick("touch", "pet"))
 
     def on_feed(self, event=None) -> None:
+        self.cancel_long_press()
+        self.swallow_release = True  # the release after the second press is not another pat
         self.life.stats["feeds"] += 1
         self.life.bump("mood", 9.0)
         self.life.bump("energy", 12.0)
@@ -712,7 +893,13 @@ class Pet:
         self.y += old_height - self.frame_size[1]
         self.pinned = True
         self.anchor, self.floor = self.x, self.y
+        self.squash = -0.05 if event.delta > 0 else 0.05  # she stretches going up, settles coming down
         self.place()
+
+    def drop_to_desk(self) -> None:
+        self.pinned = True
+        self.airborne = True
+        self.velocity = (0.0, 0.0)
 
     def place(self) -> None:
         where = (int(self.x), int(self.y))
@@ -724,10 +911,21 @@ class Pet:
 
     # ---------- menu ----------
 
+    def check_hover(self, now: float) -> None:
+        """A pointer parked on her for two seconds earns a comment, at 1Hz not per event."""
+        if not self.pointer_on_her_since or now - self.pointer_on_her_since < 2.0:
+            return
+        if now - self.last_watched < 45:
+            return
+        self.last_watched = now
+        self.say(self.speech.pick("touch", "watched", **self.line_vars()))
+
     def on_menu(self, event) -> None:
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="喂食", command=self.on_feed)
         menu.add_command(label="摸头", command=self.on_pet)
+        menu.add_command(label="让她跳一下", command=lambda: self.force("jumping", 1.6))
+        menu.add_command(label="把她放到桌面上", command=self.drop_to_desk)
         menu.add_command(
             label="叫醒她" if self.life.sleeping else "让她小睡", command=self.toggle_sleep
         )

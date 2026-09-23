@@ -154,6 +154,19 @@ def band_scale_fast(image: Image.Image, top: float, bottom: float, factor: float
     return out
 
 
+def scale_about(image: Image.Image, factor: float, anchor_row: float) -> Image.Image:
+    """Stretch or squash the whole cell about one row - landing keeps her feet planted."""
+    if abs(factor - 1.0) < 1e-4:
+        return image
+    return image.transform(
+        (image.width, image.height),
+        Image.Transform.AFFINE,
+        (1.0, 0.0, 0.0, 0.0, 1.0 / factor, anchor_row - anchor_row / factor),
+        resample=Image.Resampling.BILINEAR,
+        fillcolor=(0, 0, 0, 0),
+    )
+
+
 def simple_pendulum(height: int, pivot: float, amp: float, rigid_above: float | None = None) -> np.ndarray:
     """Same-sign lean above and below the pivot, like swaying on a string.
 

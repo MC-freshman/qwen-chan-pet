@@ -156,6 +156,16 @@ def cursor_pos() -> tuple[int, int]:
     return point.x, point.y
 
 
+SPI_GETWORKAREA = 0x0030
+
+
+def work_area() -> tuple[int, int, int, int]:
+    """The desktop minus the taskbar - where her feet are allowed to land."""
+    rect = W.RECT()
+    user32.SystemParametersInfoW(SPI_GETWORKAREA, 0, C.byref(rect), 0)
+    return rect.left, rect.top, rect.right, rect.bottom
+
+
 WS_CAPTION = 0x00C00000
 GWL_STYLE = -16
 
