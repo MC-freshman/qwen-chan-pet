@@ -47,6 +47,15 @@ MIRROR_PAIR = {"running-right": "running-left", "running-left": "running-right"}
 # States quiet enough to carry the runtime life layer; the moving ones already have
 # their own choreography baked in.
 CALM_STATES = {"idle", "waiting", "review", "failed"}
+# Where each touched body part sends her: the first name is a standalone-only reaction
+# pose that exists only when its frames are on disk, the second is the baked fallback.
+ZONE_STATE = {
+    "hat": ("waving", "waving"),
+    "face": ("shy", "waving"),
+    "hair": ("annoyed", "failed"),
+    "skirt": ("shy", "waving"),
+    "body": ("waving", "waving"),
+}
 DEFAULT_CYCLE = 2.0
 PHOTO_CACHE = 420
 RESIDENT_STATES = 6
@@ -163,6 +172,11 @@ class Pet:
 
         self.dpi = winutil.system_scale()
         self.set_scale(self.cfg["scale"])
+        # Standalone-only reaction poses (shy / annoyed / dizzy): they are not part of
+        # the Qoder nine-row contract, so the pet discovers them from the frames folder.
+        self.extra_states = {
+            path.name for path in FRAMES_DIR.iterdir() if path.is_dir()
+        } if FRAMES_DIR.is_dir() else set()
         self.anchor = 0.0
         self.floor = 0.0
         self.x = 0.0
@@ -279,7 +293,7 @@ class Pet:
             raw = [Image.open(path) for path in files]
             charm_free = True
         else:
-            row = ROW_STATES.index(state) * SHEET_CELL[1]
+            row = (ROW_STATES.index(state) if state in ROW_STATES else ROW_STATES.index("idle")) * SHEET_CELL[1]
             raw = [
                 self.sheet_image().crop(
                     (
@@ -481,6 +495,8 @@ class Pet:
         if now < self.forced_until and self.forced_state:
             return self.forced_state
         self.forced_state = None
+        if self.airborne:
+            return "dizzy" if "dizzy" in self.extra_states else "waiting"
         limit = self.cfg["wander_range"] * self.pixel_scale
         if self.x > self.anchor + limit:
             return "running-left"          # 越界期间先走回来，别让随机状态再把她推出去
@@ -507,6 +523,11 @@ class Pet:
         }
         states = list(weights)
         return self.rng.choices(states, [weights[s] for s in states])[0]
+
+    def react(self, wanted: str, fallback: str, seconds: float = 1.4) -> None:
+        """Prefer the dedicated reaction pose; use a baked one when its frames are not
+        installed - the Qoder package only ever ships the nine contract rows."""
+        self.force(wanted if wanted in self.extra_states else fallback, seconds)
 
     def force(self, state: str, seconds: float = 1.5) -> None:
         self.forced_state = state
@@ -810,6 +831,7 @@ class Pet:
         self.life.stats["drags"] += 1
         self.life.bump("mood", -1.0)
         self.life.bump("curiosity", 2.0)
+        self.react("dizzy", "waiting", 1.2)
         self.say(self.speech.pick("touch", "thrown", **self.line_vars()))
 
     def physics(self, dt: float) -> None:
@@ -835,6 +857,7 @@ class Pet:
             self.squash = min(0.16, impact / 9000.0)
             self.velocity = (self.velocity[0] * 0.55, -impact * 0.34)
             if impact > 700:
+                self.react("dizzy", "waiting", 1.0)
                 self.say(self.speech.pick("touch", "landed", **self.line_vars()))
             if abs(self.velocity[1]) < 130:
                 self.land()
@@ -858,7 +881,7 @@ class Pet:
         if streak >= 6:
             self.life.bump("mood", -1.5)
             self.life.bump("affection", 0.5)
-            self.force("failed", 1.4)
+            self.react("annoyed", "failed", 1.6)
             self.say(self.speech.pick("touch", "annoyed", **self.line_vars()))
             return
         if self.life.needs["mood"] < 30:
@@ -877,7 +900,8 @@ class Pet:
         self.life.bump("curiosity", 1.0)
         if zone == "hat":
             self.lean = 6.0 * (self.frame_size[1] / DISPLAY_BASE[1])
-        self.force("waving", 1.4)
+        wanted, fallback = ZONE_STATE.get(zone, ("waving", "waving"))
+        self.react(wanted, fallback, 1.4)
         self.say(self.speech.pick("touch", zone) or self.speech.pick("touch", "pet"))
 
     def on_feed(self, event=None) -> None:

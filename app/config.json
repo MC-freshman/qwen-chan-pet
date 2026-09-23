@@ -29,6 +29,9 @@
     "failed": 3.6,
     "waiting": 3.8,
     "running": 0.9,
-    "review": 3.2
+    "review": 3.2,
+    "shy": 2.6,
+    "annoyed": 3.2,
+    "dizzy": 1.6
   }
 }

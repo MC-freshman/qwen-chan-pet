@@ -46,8 +46,8 @@ powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 
 ## 操控
 
-**她分得清你点在哪里**：按帽子她会护住、戳脸会害羞、拽头发会躲、拉裙摆会遮、拍身子应一声；
-点在她旁边的空气上不算摸她。
+**她分得清你点在哪里**：按帽子她会护住、戳脸和拉裙摆她会**害羞**（双手捂脸那个新姿势）、
+拽头发她会**恼**、拍身子应一声；点在她旁边的空气上不算摸她。
 
 单击摸头 · 双击喂食 · **按住 0.45 秒挠痒** · 拖拽钉住 · **甩出去她会掉在桌面上弹一下再站稳** ·
 滚轮改大小（她跟着抻一下）· 右键菜单（跳一下 / 把她放到桌面 / 小睡 / 别说话 / 回到 Qoder 窗边 / 看看数值 / 写日记 / 退出）
@@ -98,7 +98,7 @@ powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 
 | | 数值 |
 | --- | --- |
-| 帧数 | 172 帧 / 9 状态（每状态 16–24 帧） |
+| 帧数 | 232 帧 / 12 状态（9 个契约状态 + 3 个反应专用态，每状态 16–24 帧） |
 | 出帧分辨率 | 384×416 渲染，Qoder 包降采样回 192×208 契约格 |
 | 播放 | 按墙钟取帧，一跳多长来自 `cycle_seconds`；显示帧率目标 20fps、实测 15.7fps（Windows 定时器粒度 15.6ms，`after(50)` 落到 62.5ms） |
 | 常驻开销 | 安静态每帧 6.2ms（约 10% 单核），其余状态走预烘帧；帧按状态懒加载，常驻最近 6 个状态 |
@@ -120,6 +120,10 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠�
 `build_motion.py` 复用 `build_qwen_spritesheet.py` 的去背、安全区与姿态编排，两者共用同一份素材源。
 精灵表 `1536×1872`：8 列 × 9 行，每格 `192×208`，行序
 `idle / running-right / running-left / waving / jumping / failed / waiting / running / review`。
+
+三个**反应专用态** `shy / annoyed / dizzy` 只出 `app/frames/`，不进精灵表——九行是 Qoder 包的硬契约。
+运行时按目录发现它们（`extra_states`），缺帧就退回最近的烘焙态，所以 Qoder 那份不会崩。
+`python build_motion.py shy annoyed dizzy` 只重建这几个状态（顺带保留 `rig.json` 里其余条目）。
 
 两个坑写死在脚本里：
 

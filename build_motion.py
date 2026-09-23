@@ -76,6 +76,34 @@ MOTION = {
     for state, keys in base.MOTION.items()
 }
 
+# Standalone-only reactions. The Qoder sheet is a fixed nine-row contract, so these
+# never enter it: they exist as app/frames/<state>/ and as gestures in the running pet.
+EXTRA_MOTION = {
+    "shy": [
+        (0, 0, 0.0, 0.00), (-1, -1, -2.0, 0.01), (-2, -2, -3.0, 0.015), (-1, -1, -1.5, 0.005),
+        (0, 0, 0.0, 0.00), (1, -1, 1.5, 0.005), (2, -2, 3.0, 0.015), (1, -1, 2.0, 0.01),
+    ],
+    "annoyed": [
+        (0, 0, -1.5, 0.00), (0, 2, -2.5, -0.02), (1, 3, -3.5, -0.025), (1, 1, -2.5, -0.01),
+        (0, 0, -1.5, 0.00), (0, 2, -2.0, -0.015), (-1, 3, -3.0, -0.02), (-1, 1, -2.0, -0.005),
+    ],
+    "dizzy": [
+        (0, 0, 0.0, 0.00), (3, 1, 5.0, -0.01), (5, 2, 8.0, -0.02), (3, 1, 5.0, -0.01),
+        (0, 0, 0.0, 0.00), (-3, 1, -5.0, -0.01), (-5, 2, -8.0, -0.02), (-3, 1, -5.0, -0.01),
+    ],
+}
+EXTRA_FIT = {"shy": (172, 0), "annoyed": (170, 0), "dizzy": (172, 0)}
+EXTRA_FRAMES = {"shy": 20, "annoyed": 20, "dizzy": 20}
+
+FIT.update({state: (height * S, bias * S) for state, (height, bias) in EXTRA_FIT.items()})
+MOTION.update({
+    state: [(dx * S, dy * S, tilt, squash) for dx, dy, tilt, squash in keys]
+    for state, keys in EXTRA_MOTION.items()
+})
+FRAMES.update(EXTRA_FRAMES)
+POSES = {**base.POSES, **{state: f"qwen-chibi-{state}" for state in EXTRA_MOTION}}
+CONTRACT = [state for state, _ in base.STATES]
+
 OUT_FRAMES = ROOT / "app" / "frames"
 OUT_SHEET = ROOT / "out" / "spritesheet.webp"
 CONFIG = ROOT / "app" / "config.json"
@@ -326,13 +354,17 @@ def sheet_cell(frame: Image.Image) -> Image.Image:
 
 def main() -> None:
     cycles = cycle_seconds()
+    only = set(sys.argv[1:])
     OUT_SHEET.parent.mkdir(exist_ok=True)
     sheet = Image.new("RGBA", (SHEET_W * base.COLS, SHEET_H * base.ROWS), (0, 0, 0, 0))
-    rig_map = {}
-    for row, state in enumerate(base.ROW_STATES if hasattr(base, "ROW_STATES") else [s for s, _ in base.STATES]):
+    rig_file = OUT_FRAMES / "rig.json"
+    rig_map = json.loads(rig_file.read_text(encoding="utf-8")) if (only and rig_file.exists()) else {}
+    for row, state in enumerate(CONTRACT + list(EXTRA_MOTION)):
+        if only and state not in only:
+            continue
         count = FRAMES[state]
         cycle = cycles[state]
-        sprite = base.trim(base.cutout(base.find_source(base.POSES[state])))
+        sprite = base.trim(base.cutout(base.find_source(POSES[state])))
         if state in base.MIRROR:
             sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         sprite, _probe, box = fit_state(state, count, sprite, cycle)
@@ -351,22 +383,26 @@ def main() -> None:
             "eye": None if lines["eye"] is None else lines["eye"] / CELL_H,
             "chin": None if lines["chin"] is None else lines["chin"] / CELL_H,
         }
-        keep = min(base.COLS, count)
-        picks = [round(k * (count - 1) / (keep - 1)) for k in range(keep)] if keep > 1 else [0]
-        for col, index in enumerate(picks):
-            # The sheet keeps its ceiling ornament and its baked breathing and blinks:
-            # a Qoder pet window has no life layer running under it.
-            charming = animate(state, index, count, sprite, springs, cycle,
-                               charm=True, baked_life=True)
-            sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
-        print(f"{state:14s} {count:2d} frames / {cycle:.1f}s = {count / cycle:4.1f}fps  "
-              f"art box={box}  "
-              f"{'OK' if box[0] >= SAFE_SIDE and box[1] >= SAFE_TOP and box[2] <= CELL_W - SAFE_SIDE else 'VIOLATION'}")
+        if state in CONTRACT:
+            keep = min(base.COLS, count)
+            picks = [round(k * (count - 1) / (keep - 1)) for k in range(keep)] if keep > 1 else [0]
+            for col, index in enumerate(picks):
+                # The sheet keeps its ceiling ornament and its baked breathing and blinks:
+                # a Qoder pet window has no life layer running under it.
+                charming = animate(state, index, count, sprite, springs, cycle,
+                                   charm=True, baked_life=True)
+                sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
+        print(f"{state:14s} {count:2d} frames / {cycle:.2f}s = {count / cycle:4.1f}fps  art box={box}  "
+              f"{'OK' if box[0] >= SAFE_SIDE and box[1] >= SAFE_TOP and box[2] <= CELL_W - SAFE_SIDE else 'VIOLATION'}"
+              f"{'' if state in CONTRACT else '  (独立宠物专用)'}")
     (OUT_FRAMES / "rig.json").write_text(json.dumps(rig_map, ensure_ascii=False, indent=2), encoding="utf-8")
     for state, lines in rig_map.items():
         eye = "-" if lines["eye"] is None else f"{lines['eye']:.3f}"
         chin = "-" if lines["chin"] is None else f"{lines['chin']:.3f}"
         print(f"  {state:14s} eye={eye} chin={chin}")
+    if only:
+        print("部分重建：精灵表未改动")
+        return
     sheet.save(OUT_SHEET, lossless=True)
     sheet.save(ROOT / "out" / "spritesheet.png")
     base.preview(ROOT / "out" / "preview.png")
@@ -376,7 +412,7 @@ def main() -> None:
 
 
 def contact(target: Path) -> None:
-    states = ["idle", "running-right", "waiting"]
+    states = ["idle", "shy", "annoyed", "dizzy"]
     tiles = []
     for state in states:
         files = sorted((OUT_FRAMES / state).glob("*.png"))
