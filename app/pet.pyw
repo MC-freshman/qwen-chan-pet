@@ -602,7 +602,7 @@ class Pet:
         if self.qoder_gone_since is None:
             self.qoder_gone_since = now
         elif now - self.qoder_gone_since > self.cfg["watchdog_grace_seconds"]:
-            self.quit()
+            self.quit(intent=False)   # 不是他让我走的，别把这个记成"别再回来"
             return True
         return False
 

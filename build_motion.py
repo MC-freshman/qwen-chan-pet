@@ -117,9 +117,19 @@ POSE_SETS = {
 }
 STRIDE = 4
 
+_palette_reference: Image.Image | None = None
+
 
 def stride_frame(state: str, index: int) -> int:
     return (index // STRIDE) % 2 if state in POSE_SETS else 0
+
+
+def palette_reference() -> Image.Image:
+    """The idle pose: every other pose is pulled onto its white balance if it drifted."""
+    global _palette_reference
+    if _palette_reference is None:
+        _palette_reference = base.trim(base.cutout(base.find_source(POSES["idle"])))
+    return _palette_reference
 
 
 def load_sprites(state: str) -> list[Image.Image]:
@@ -127,6 +137,7 @@ def load_sprites(state: str) -> list[Image.Image]:
     sprites = []
     for name in names:
         sprite = base.trim(base.cutout(base.find_source(name)))
+        sprite = base.match_palette(sprite, palette_reference())
         if state in base.MIRROR:
             sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
         sprites.append(sprite)

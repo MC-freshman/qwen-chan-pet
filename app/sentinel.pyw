@@ -64,10 +64,21 @@ def main() -> None:
         print("提示：用 pythonw.exe 启动哨兵才不会留控制台窗口", file=sys.stderr)
     qoder_since: float | None = None
     qoder_was_up = bool(winutil.process_ids(winutil.QODER_EXE))
+    session = winutil.window_pid(winutil.qoder_main_window()) if winutil.qoder_main_window() else 0
     while True:
         running = bool(winutil.process_ids(winutil.QODER_EXE))
+        current_session = 0
+        hwnd = winutil.qoder_main_window()
+        if hwnd:
+            current_session = winutil.window_pid(hwnd)
         if qoder_was_up and not running:
             QUIT_FLAG.unlink(missing_ok=True)   # Qoder 关过一轮 = 上一次"别烦我"作废
+        elif current_session and session and current_session != session:
+            # 主窗口换了进程 = 新会话。光靠"关过一轮"不够：她自己的看门狗在 Qoder 关闭
+            # 十几秒后才退出，那时标记已经被清掉，它又把标记写了回来，于是下次开机永远不醒。
+            QUIT_FLAG.unlink(missing_ok=True)
+        if current_session:
+            session = current_session
         qoder_was_up = running
         current = pet_pid()
         alive = current and winutil.process_alive(current)

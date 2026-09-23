@@ -149,6 +149,87 @@ FIT = {
 MIRROR = {"running-left"}
 
 
+def palette_anchors(image: Image.Image):
+    """(dark mean, hair mean, light mean) per channel, plus the hair band's luminance.
+
+    The navy hat and cape come out of every generation within a couple of levels and
+    so does the white petticoat, while the lavender hair wanders by up to twenty -
+    the hair band is what needs pulling back, and the two flanking anchors say how far
+    the correction has to fade out before it reaches them.
+    """
+    import numpy as np
+
+    rgb = np.asarray(image.convert("RGB")).astype(float)
+    alpha = np.asarray(image.getchannel("A")) > 128
+    luma = rgb.mean(axis=2)
+    red, green, blue = rgb[:, :, 0], rgb[:, :, 1], rgb[:, :, 2]
+    dark = alpha & (luma < 120)
+    hair = alpha & (blue > red + 20) & (blue > 150) & (red > 90) & (red < 210)
+    light = alpha & (rgb.min(axis=2) > 200)
+    if dark.sum() < 20000 or hair.sum() < 20000 or light.sum() < 20000:
+        return None
+    return {
+        "dark": rgb[dark].mean(axis=0),
+        "hair": rgb[hair].mean(axis=0),
+        "light": rgb[light].mean(axis=0),
+        "luma": float(luma[hair].mean()),
+        "dark_luma": float(luma[dark].mean()),
+        "light_luma": float(luma[light].mean()),
+    }
+
+
+def match_palette(image: Image.Image, reference: Image.Image) -> Image.Image:
+    """Pull a pose's hair band onto the reference palette, fading out before the navy
+    and the whites.
+
+    Each generation of AI art brings its own white balance, so two poses made in
+    different runs alternate on screen as a hair colour flicker. Correcting the whole
+    tonal range drags the hat and the petticoat with it, so the shift is applied at
+    full strength only in the hair band and blended to zero at the two anchors around
+    it - which is also why poses that are already in family are left byte-for-byte.
+    """
+    import numpy as np
+
+    source = palette_anchors(image)
+    target = palette_anchors(reference)
+    if source is None or target is None:
+        return image
+    if float(np.abs(source["hair"] - target["hair"]).max()) < 6.0:
+        return image
+
+    rgb = np.asarray(image.convert("RGB")).astype(float)
+    alpha = np.asarray(image.getchannel("A"))
+    luma = rgb.mean(axis=2)
+
+    def _fade(distance: np.ndarray, reach: float) -> np.ndarray:
+        x = np.clip(1.0 - distance / max(1.0, reach), 0.0, 1.0)
+        return x * x * (3.0 - 2.0 * x)
+
+    below = max(20.0, source["luma"] - source["dark_luma"])
+    above = max(20.0, source["light_luma"] - source["luma"])
+    weight = _fade(np.maximum(0.0, source["luma"] - luma), below) * _fade(
+        np.maximum(0.0, luma - source["luma"]), above
+    )
+
+    def _render(pixels: np.ndarray) -> Image.Image:
+        out = Image.fromarray(np.clip(pixels, 0, 255).astype(np.uint8), "RGB")
+        out.putalpha(Image.fromarray(alpha, "L"))
+        return out
+
+    # The band weight averages well under 1 across the hair mask, so one pass only
+    # closes part of the gap; iterate on what the previous pass actually measured.
+    pixels = rgb
+    for _ in range(4):
+        now = palette_anchors(_render(pixels))
+        if now is None:
+            return image
+        residual = np.clip(target["hair"] - now["hair"], -30.0, 30.0)
+        if float(np.abs(residual).max()) < 1.5:
+            break
+        pixels = pixels + residual[None, None, :] * weight[:, :, None]
+    return _render(pixels)
+
+
 def find_source(name: str) -> Path:
     hits = sorted(SRC.glob(f"{name}_*.png"))
     if not hits:
