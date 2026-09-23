@@ -42,8 +42,12 @@ ROW_STATES = [
     "review",
 ]
 MIRROR_PAIR = {"running-right": "running-left", "running-left": "running-right"}
+# States quiet enough to carry the runtime life layer; the moving ones already have
+# their own choreography baked in.
+CALM_STATES = {"idle", "waiting", "review", "failed"}
 DEFAULT_CYCLE = 2.0
 PHOTO_CACHE = 420
+RESIDENT_STATES = 6
 MAGIC = "#ff00fe"
 # A key-colour window cannot blend, so the silhouette edge is hardened to 0/255.
 # As a 256-entry table: Image.point with a Python lambda costs a callback per pixel,
@@ -224,6 +228,7 @@ class Pet:
         self.cells: dict[str, list[Image.Image]] = {}
         self.head: dict[str, tuple[float, float]] = {}
         self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
+        self.layer = rigor.LifeLayer(self.rng)
         self.sheet: Image.Image | None = None
         rig_file = FRAMES_DIR / "rig.json"
         self.rig = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
@@ -275,18 +280,21 @@ class Pet:
         self.head[state] = head_anchor(cells[0])
         self.cells[state] = cells
         for other in list(self.cells):
-            if len(self.cells) <= 4:
+            if len(self.cells) <= RESIDENT_STATES:
                 break
             if other != state:
                 del self.cells[other]
                 self.head.pop(other, None)
         return cells
 
-    def render(self, state: str, index: int, gaze: int) -> ImageTk.PhotoImage:
+    def render(self, state: str, index: int, gaze: int, live: float | None = None) -> ImageTk.PhotoImage:
+        """One drawn frame. `live` is the wall clock for the life layer, and a frame
+        that has been deformed by it is unique, so it never enters the photo cache."""
         key = (state, index, gaze)
-        photo = self.photos.get(key)
-        if photo is not None:
-            return photo
+        if live is None:
+            photo = self.photos.get(key)
+            if photo is not None:
+                return photo
         cells = self.load_state(state)
         cell = cells[index % len(cells)]
         if gaze:
@@ -299,15 +307,30 @@ class Pet:
             cell = rigor.shear_rows_fast(
                 cell, rigor.head_follow_profile(cell.height, chin, gaze * 2.2 * unit, shoulder=26.0 * unit)
             )
+        if live is not None:
+            cell = self.layer.apply(cell, live)
+        if gaze or live is not None:
             cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         flat = Image.new("RGB", cell.size, (255, 0, 254))
         flat.paste(cell, (0, 0), cell)
         photo = ImageTk.PhotoImage(flat)
-        self.photos[key] = photo
-        while len(self.photos) > PHOTO_CACHE:
-            self.photos.pop(next(iter(self.photos)))  # oldest first: dropping them all
-            # at once costs a full repaint pass and shows up as a hitch.
+        if live is None:
+            self.photos[key] = photo
+            while len(self.photos) > PHOTO_CACHE:
+                self.photos.pop(next(iter(self.photos)))  # oldest first: dropping them all
+                # at once costs a full repaint pass and shows up as a hitch.
         return photo
+
+    def sync_landmarks(self) -> None:
+        """Where her eyes and chin sit in the drawn cell, for the life layer's blink."""
+        spec = self.rig.get(self.state) or {}
+        height = self.frame_size[1]
+        eye = spec.get("eye")
+        chin = spec.get("chin") or eye
+        self.layer.set_landmarks(
+            eye * height if eye else None,
+            chin * height if chin else None,
+        )
 
     def bind_events(self) -> None:
         self.label.bind("<ButtonPress-1>", self.on_press)
@@ -362,7 +385,8 @@ class Pet:
         # its 8 frames at whatever the tick was, which read as a 0.5s shiver.
         cycle = self.cycles.get(self.state, DEFAULT_CYCLE)
         index = int((now - self.state_started) / cycle * len(cells)) % len(cells)
-        photo = self.render(self.state, index, self.gaze)
+        photo = self.render(self.state, index, self.gaze,
+                            live=now if self.state in CALM_STATES else None)
         self.label.configure(image=photo)
         self.image = photo
         self.place()
@@ -374,6 +398,7 @@ class Pet:
             self.state_started = now  # 跑到边界掉头时沿用步幅相位，不重新起步
         self.state = state
         self.state_until = now + self.dwell(state)
+        self.sync_landmarks()
 
     def update_gaze(self, now: float) -> None:
         """She turns her head toward the cursor, and stops when nobody is around."""
@@ -454,6 +479,7 @@ class Pet:
         self.state = state
         self.state_started = time.time()
         self.state_until = self.forced_until
+        self.sync_landmarks()
 
     # ---------- fullscreen courtesy ----------
 

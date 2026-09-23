@@ -194,11 +194,13 @@ def art_span(content: Image.Image) -> tuple[int, int]:
     return box[1], box[3]
 
 
-def render_state(state: str, count: int, sprite: Image.Image, height: int, cycle: float):
+def render_state(state: str, count: int, sprite: Image.Image, height: int, cycle: float,
+                 baked_life: bool = True):
     scaled = base.fit(sprite, height, max_width=CELL_W - 6 * S)
     springs = spring_series(state, count, cycle)
     return scaled, [
-        animate(state, index, count, scaled, springs, cycle, charm=False) for index in range(count)
+        animate(state, index, count, scaled, springs, cycle, charm=False, baked_life=baked_life)
+        for index in range(count)
     ]
 
 
@@ -217,10 +219,11 @@ def fit_state(state: str, count: int, sprite: Image.Image, cycle: float):
 
     The previous estimate looked only at the pre-deformation sprite, so the pendulum,
     joint twist and blink could still push the silhouette past the cell edge - that is
-    why the raised fan kept getting cut while jumping.
+    why the raised fan kept getting cut while jumping. Measured with the baked life
+    layer on, since that is the largest the silhouette ever gets.
     """
     height = FIT[state][0]
-    scaled, frames = render_state(state, count, sprite, height, cycle)
+    scaled, frames = render_state(state, count, sprite, height, cycle, baked_life=True)
     box = (0, 0, 0, 0)
     for _ in range(5):
         boxes = [art_box(frame) for frame in frames]
@@ -234,13 +237,13 @@ def fit_state(state: str, count: int, sprite: Image.Image, cycle: float):
             break
         span = max(1.0, bottom - top)
         height = max(110 * S, int(height * max(0.80, 1.0 - need / span) * 0.97))
-        scaled, frames = render_state(state, count, sprite, height, cycle)
+        scaled, frames = render_state(state, count, sprite, height, cycle, baked_life=True)
     return scaled, frames, box
 
 
 def animate(
     state: str, index: int, count: int, sprite: Image.Image, springs: tuple,
-    cycle: float, charm: bool = True,
+    cycle: float, charm: bool = True, baked_life: bool = True,
 ) -> Image.Image:
     dx, dy, tilt, squash = motion_at(state, index, count)
     body = base.transform(sprite, dx, dy, tilt, squash, pad=PAD, foot=FOOT)
@@ -280,14 +283,17 @@ def animate(
         )
 
     phase = index / count
-    if state in CALM:
+    # Calm states get breathing and blinking from rigor.LifeLayer while she runs, off
+    # the frame clock, so the loop has no period to learn; the Qoder sheet has no such
+    # layer, so its cells keep them baked in.
+    if baked_life and state in CALM:
         breath = 1.0 + 0.011 * math.sin(2 * math.pi * phase * 2)
         centre = top + height * 0.52
         content = rigor.band_scale(content, centre - height * 0.16, centre + height * 0.16, breath)
 
     # One blink per cycle, two frames wide - only where the loop is sampled finely
     # enough that two frames read as a blink instead of a hitch.
-    if count / cycle >= 6:
+    if (baked_life or state not in CALM) and count / cycle >= 6:
         offset = abs(math.sin(2 * math.pi * (phase + 0.37 * (index % 3))))
         if offset < BLINK_WINDOW:
             lines = face_lines(content)
@@ -329,12 +335,15 @@ def main() -> None:
         sprite = base.trim(base.cutout(base.find_source(base.POSES[state])))
         if state in base.MIRROR:
             sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        sprite, frames, box = fit_state(state, count, sprite, cycle)
+        sprite, _probe, box = fit_state(state, count, sprite, cycle)
+        springs = spring_series(state, count, cycle)
         folder = OUT_FRAMES / state
         folder.mkdir(parents=True, exist_ok=True)
         for old in folder.glob("*.png"):
             old.unlink()
-        for index, frame in enumerate(frames):
+        for index in range(count):
+            frame = animate(state, index, count, sprite, springs, cycle,
+                            charm=False, baked_life=False)
             base.clear_hidden_rgb(frame).save(folder / f"{index:02d}.png")
         first = Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA")
         lines = face_lines(first)
@@ -345,9 +354,10 @@ def main() -> None:
         keep = min(base.COLS, count)
         picks = [round(k * (count - 1) / (keep - 1)) for k in range(keep)] if keep > 1 else [0]
         for col, index in enumerate(picks):
-            # The sheet keeps its ceiling ornament; the standalone window drops it.
-            charming = animate(state, index, count, sprite,
-                               spring_series(state, count, cycle), cycle, charm=True)
+            # The sheet keeps its ceiling ornament and its baked breathing and blinks:
+            # a Qoder pet window has no life layer running under it.
+            charming = animate(state, index, count, sprite, springs, cycle,
+                               charm=True, baked_life=True)
             sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
         print(f"{state:14s} {count:2d} frames / {cycle:.1f}s = {count / cycle:4.1f}fps  "
               f"art box={box}  "

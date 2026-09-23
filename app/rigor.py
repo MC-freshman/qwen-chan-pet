@@ -12,6 +12,10 @@ their kinks makes the approximation near-exact.
 
 from __future__ import annotations
 
+import math
+import random
+import time
+
 import numpy as np
 from PIL import Image
 
@@ -215,6 +219,77 @@ def polar_twist(image, pivot, amp_deg, r_in, r_out, theta0, theta1, feather=22.0
     out = np.clip(a + b, 0, 255).astype(np.uint8)
     out[out[:, :, 3] == 0, :3] = 0
     return Image.fromarray(out, "RGBA")
+
+
+class LifeLayer:
+    """The never-repeating micro-motion she keeps while standing still.
+
+    Baked frames loop, however many there are: at 24 frames over 4s a viewer learns
+    the period inside a minute. This layer runs off-clock instead - three
+    incommensurate sway periods, a slow breath, random blink gaps and an occasional
+    deliberate head turn - so a calm state has no seam to find. Amplitudes are
+    multiples of a 208px cell, so a 2x render needs no retuning.
+    """
+
+    def __init__(self, rng: random.Random | None = None) -> None:
+        self.random = random.Random() if rng is None else rng
+        self.t0 = time.time()
+        self.phase = self.random.uniform(0.0, math.tau)
+        self.next_blink = self.t0 + self.random.uniform(1.2, 3.5)
+        self.blink_until = 0.0
+        self.next_turn = self.t0 + self.random.uniform(7.0, 20.0)
+        self.turn_from = 0.0
+        self.turn_until = 0.0
+        self.turn_dir = 1.0
+        self.eye_row: float | None = None
+        self.chin_row: float | None = None
+
+    def set_landmarks(self, eye_row: float | None, chin_row: float | None) -> None:
+        self.eye_row = eye_row
+        self.chin_row = chin_row
+
+    def _blink(self, now: float) -> float:
+        if now >= self.next_blink:
+            self.blink_until = now + 0.09
+            self.next_blink = now + self.random.uniform(2.2, 7.5)
+        return 0.55 if now < self.blink_until else 1.0
+
+    def _turn(self, now: float, unit: float) -> float:
+        """Envelope-shaped head turn: eases out and back, never a step."""
+        if now >= self.next_turn:
+            self.turn_from = now
+            self.turn_until = now + self.random.uniform(0.8, 1.5)
+            self.turn_dir = self.random.choice((-1.0, 1.0))
+            self.next_turn = self.turn_until + self.random.uniform(6.0, 24.0)
+        if not (self.turn_from <= now < self.turn_until) or self.chin_row is None:
+            return 0.0
+        progress = (now - self.turn_from) / (self.turn_until - self.turn_from)
+        return self.turn_dir * 2.6 * unit * math.sin(math.pi * progress)
+
+    def apply(self, cell: Image.Image, now: float) -> Image.Image:
+        unit = cell.height / 208.0
+        height = cell.height
+        t = now - self.t0
+        sway = (
+            0.60 * math.sin(t * 0.90 + self.phase)
+            + 0.29 * math.sin(t * 0.37 + 0.4)
+            + 0.11 * math.sin(t * 1.73 + 1.1)
+        ) * 2.4 * unit
+        image = shear_rows_fast(
+            cell,
+            simple_pendulum(height, height * 0.66, sway, rigid_above=height * 0.30),
+        )
+        breath = 1.0 + 0.012 * math.sin(t * (math.tau / 3.9) + self.phase) + 0.004 * math.sin(t * 0.21)
+        image = band_scale_fast(image, height * 0.36, height * 0.68, breath)
+        blink = self._blink(now)
+        if blink != 1.0 and self.eye_row is not None:
+            image = band_scale_fast(image, self.eye_row - 6.0 * unit, self.eye_row + 8.0 * unit, blink)
+        turn = self._turn(now, unit)
+        if turn:
+            image = shear_rows_fast(
+                image, head_follow_profile(height, self.chin_row, turn, shoulder=26.0 * unit)
+            )
+        return image
 
 
 class Spring:
