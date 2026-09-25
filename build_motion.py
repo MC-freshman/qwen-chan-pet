@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import shutil
 import sys
 from pathlib import Path
 
@@ -117,6 +118,13 @@ POSE_SETS = {
 }
 STRIDE = 4
 
+# 镜像态不靠"把带方向的量取反"去凑：rigor.polar_twist 的扇形 feather 只在起始边斜坡，
+# 实测振幅取反后仍有 1.6% 的像素不互为镜像。所以形参整套沿用正向态，最后把成品帧整幅翻。
+MIRROR_SOURCE = {"running-left": "running-right"}
+for _state, _source in MIRROR_SOURCE.items():
+    FIT[_state] = FIT[_source]
+    MOTION[_state] = MOTION[_source]
+
 _palette_reference: Image.Image | None = None
 
 
@@ -138,8 +146,7 @@ def load_sprites(state: str) -> list[Image.Image]:
     for name in names:
         sprite = base.trim(base.cutout(base.find_source(name)))
         sprite = base.match_palette(sprite, palette_reference())
-        if state in base.MIRROR:
-            sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        # 镜像态在这里不翻：成品帧写盘前整幅翻，见 main()
         sprites.append(sprite)
     return sprites
 
@@ -278,6 +285,12 @@ def art_box(frame: Image.Image) -> tuple[int, int, int, int]:
     return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
 
+def fits(box) -> bool:
+    """成品剪影有没有留在自己的安全框里：左右 SAFE_SIDE、上 SAFE_TOP、下留 FOOT_MARGIN。"""
+    return (box[0] >= SAFE_SIDE and box[1] >= SAFE_TOP
+            and box[2] <= CELL_W - SAFE_SIDE and box[3] <= CELL_H - FOOT_MARGIN)
+
+
 def fit_state(state: str, count: int, sprites: list, cycle: float):
     """Shrink until the *finished* frames fit the safe box.
 
@@ -296,7 +309,8 @@ def fit_state(state: str, count: int, sprites: list, cycle: float):
         right = max(b[2] for b in boxes)
         bottom = max(b[3] for b in boxes)
         box = (left, top, right, bottom)
-        need = max(SAFE_SIDE - left, right - (CELL_W - SAFE_SIDE), SAFE_TOP - top)
+        need = max(SAFE_SIDE - left, right - (CELL_W - SAFE_SIDE), SAFE_TOP - top,
+                   bottom - (CELL_H - FOOT_MARGIN))   # 底边也算：脚被切就是这里漏的
         if need <= 0:
             break
         span = max(1.0, bottom - top)
@@ -391,6 +405,11 @@ def sheet_cell(frame: Image.Image) -> Image.Image:
 def main() -> None:
     cycles = cycle_seconds()
     only = set(sys.argv[1:])
+    unknown = only - set(FRAMES)
+    if unknown:
+        raise SystemExit(f"没有这些状态：{sorted(unknown)}；可选：{sorted(FRAMES)}")
+    rebuilt: list[str] = []
+    bad: list[str] = []
     OUT_SHEET.parent.mkdir(exist_ok=True)
     sheet = Image.new("RGBA", (SHEET_W * base.COLS, SHEET_H * base.ROWS), (0, 0, 0, 0))
     rig_file = OUT_FRAMES / "rig.json"
@@ -407,33 +426,55 @@ def main() -> None:
         folder.mkdir(parents=True, exist_ok=True)
         for old in folder.glob("*.png"):
             old.unlink()
+        mirrored = MIRROR_SOURCE.get(state)
         for index in range(count):
             frame = animate(state, index, count, scaled[stride_frame(state, index)], springs,
                             cycle, charm=False, baked_life=False)
-            base.clear_hidden_rgb(frame).save(folder / f"{index:02d}.png")
-        first = Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA")
-        lines = face_lines(first)
-        rig_map[state] = {
-            "eye": None if lines["eye"] is None else lines["eye"] / CELL_H,
-            "chin": None if lines["chin"] is None else lines["chin"] / CELL_H,
-        }
+            image = base.clear_hidden_rgb(frame)
+            (image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if mirrored else image).save(
+                folder / f"{index:02d}.png")
+        if mirrored and mirrored in rig_map:
+            rig_map[state] = dict(rig_map[mirrored])   # 剪影是严格镜像的，地标行照抄，不必再检一遍
+        else:
+            first = Image.open(sorted(folder.glob("*.png"))[0]).convert("RGBA")
+            lines = face_lines(first)
+            rig_map[state] = {
+                "eye": None if lines["eye"] is None else lines["eye"] / CELL_H,
+                "chin": None if lines["chin"] is None else lines["chin"] / CELL_H,
+            }
         if state in CONTRACT:
             keep = min(base.COLS, count)
             picks = [round(k * (count - 1) / (keep - 1)) for k in range(keep)] if keep > 1 else [0]
             for col, index in enumerate(picks):
                 # The sheet keeps its ceiling ornament and its baked breathing and blinks:
                 # a Qoder pet window has no life layer running under it.
-                charming = animate(state, index, count, scaled[stride_frame(state, index)],
-                                   springs, cycle, charm=True, baked_life=True)
+                sprite = scaled[stride_frame(state, index)]
+                if mirrored:
+                    # 挂饰钉在格子左上角、不参与镜像：先只出画片，翻完再把挂饰垫在她后面
+                    plain = animate(state, index, count, sprite, springs, cycle,
+                                    charm=False, baked_life=True)
+                    charming = Image.new("RGBA", (CELL_W, CELL_H), (0, 0, 0, 0))
+                    charming.alpha_composite(charm_layer(state, motion_at(state, index, count)[0]),
+                                             (CHARM_X, 0))
+                    charming.alpha_composite(plain.transpose(Image.Transpose.FLIP_LEFT_RIGHT))
+                else:
+                    charming = animate(state, index, count, sprite, springs, cycle,
+                                       charm=True, baked_life=True)
                 sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
         print(f"{state:14s} {count:2d} frames / {cycle:.2f}s = {count / cycle:4.1f}fps  art box={box}  "
-              f"{'OK' if box[0] >= SAFE_SIDE and box[1] >= SAFE_TOP and box[2] <= CELL_W - SAFE_SIDE else 'VIOLATION'}"
+              f"{'OK' if fits(box) else 'VIOLATION'}"
               f"{'' if state in CONTRACT else '  (独立宠物专用)'}")
+        rebuilt.append(state)
+        if not fits(box):
+            bad.append(state)
     (OUT_FRAMES / "rig.json").write_text(json.dumps(rig_map, ensure_ascii=False, indent=2), encoding="utf-8")
     for state, lines in rig_map.items():
         eye = "-" if lines["eye"] is None else f"{lines['eye']:.3f}"
         chin = "-" if lines["chin"] is None else f"{lines['chin']:.3f}"
         print(f"  {state:14s} eye={eye} chin={chin}")
+    verify(rebuilt if only else None)   # 整表重建才顺带查精灵表的合同尺寸
+    if bad:
+        raise SystemExit(f"这些状态的剪影越出安全框，帧已写盘但得复缩：{bad}")
     if only:
         print("部分重建：精灵表未改动")
         return
@@ -441,8 +482,11 @@ def main() -> None:
     sheet.save(ROOT / "out" / "spritesheet.png")
     base.preview(ROOT / "out" / "preview.png")
     contact(ROOT / "out" / "contact.png")
-    verify()
-    print(f"sheet -> {OUT_SHEET}")
+    # 运行侧读 app/assets/，最后一步不该靠手工拷贝
+    assets = ROOT / "app" / "assets"
+    assets.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(OUT_SHEET, assets / "spritesheet.webp")
+    print(f"sheet -> {OUT_SHEET} 与 {assets / 'spritesheet.webp'}")
 
 
 def contact(target: Path) -> None:
@@ -462,10 +506,14 @@ def contact(target: Path) -> None:
     canvas.save(target)
 
 
-def verify() -> None:
+def verify(states: list[str] | None = None) -> None:
+    """质检要跟着每一次重建跑，而且四边都查：单态重建过去直接跳过这一步。"""
+    checked = states or list(FRAMES)
     clear = {"left": 999, "right": 999, "top": 999, "bottom": 999}
+    violations: list[str] = []
     total = 0
-    for state, count in FRAMES.items():
+    for state in checked:
+        count = FRAMES[state]
         paths = sorted((OUT_FRAMES / state).glob("*.png"))
         if len(paths) != count:
             raise RuntimeError(f"{state}: {len(paths)} frames written, {count} expected")
@@ -477,11 +525,18 @@ def verify() -> None:
             if box is None:
                 raise RuntimeError(f"empty frame {path}")
             left, top, right, bottom = box
+            if not fits(box):
+                violations.append(f"{path.name} of {state}: box={box}")
             clear["left"] = min(clear["left"], left)
             clear["top"] = min(clear["top"], top)
             clear["right"] = min(clear["right"], CELL_W - right)
             clear["bottom"] = min(clear["bottom"], CELL_H - bottom)
             total += 1
+    if violations:
+        raise RuntimeError(f"{len(violations)} 帧越出安全框，最早几例：{violations[:5]}")
+    if states:
+        print(f"{total} frames checked ({','.join(states)})，tightest clearance {clear}")
+        return
     sheet = Image.open(OUT_SHEET)
     if sheet.size != (SHEET_W * 8, SHEET_H * 9):
         raise RuntimeError(f"sheet is {sheet.size}, must stay {SHEET_W * 8}x{SHEET_H * 9}")

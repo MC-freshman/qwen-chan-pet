@@ -82,8 +82,11 @@ class Life:
     def tick(self, minutes: float) -> None:
         if minutes <= 0:
             return
-        self._drain(minutes, sleeping=self.sleeping)
-        self.stats["minutes_online"] = self.stats.get("minutes_online", 0) + minutes
+        # 合盖、休眠和长全屏都会让单次跨度暴涨。按离线路径同一条上限结算，
+        # 否则一次唤醒就把她扣到零，还把没在电脑前的时间记成"一起在线"。
+        drained = min(minutes, MAX_OFFLINE_MINUTES)
+        self._drain(drained, sleeping=self.sleeping)
+        self.stats["minutes_online"] = self.stats.get("minutes_online", 0) + drained
         self.last_seen = time.time()
 
     def _drain(self, minutes: float, sleeping: bool) -> None:

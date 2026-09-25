@@ -225,8 +225,11 @@ def idle_seconds() -> float:
     info.cbSize = C.sizeof(info)
     if not user32.GetLastInputInfo(C.byref(info)):
         return 0.0
-    tick = kernel32.GetTickCount()
-    return max(0.0, (tick - info.dwTime) / 1000.0)
+    # dwTime 是 32 位 tick，直接减会在连续开机约 24.8 天后变负、再被下限截成 0，
+    # 于是她永远认为你刚刚动过鼠标。64 位 tick 对 2^32 取模回绕，49.7 天内都准。
+    kernel32.GetTickCount64.restype = C.c_ulonglong
+    delta = (kernel32.GetTickCount64() - info.dwTime) % (1 << 32)
+    return delta / 1000.0
 
 
 _PROJECT_RE = re.compile(r"([A-Za-z0-9_\-.]+\.[A-Za-z]{1,5})\s*-")

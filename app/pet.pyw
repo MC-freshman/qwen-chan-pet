@@ -12,6 +12,7 @@ import random
 import sys
 import time
 import tkinter as tk
+import traceback
 from datetime import date, datetime
 from pathlib import Path
 
@@ -70,6 +71,9 @@ HARD_ALPHA = [0 if v < 128 else 255 for v in range(256)]
 BUBBLE_FONT = "C:/Windows/Fonts/msyh.ttc"
 FAST_TICK = 1 / 30
 SLOW_TICK = 1.0
+PAUSED_TICK = 0.5  # 全屏让路时的唤醒节奏：不看帧，只要有人继续叫她
+NAP_ENERGY = 12.0  # 低于这条线又没人理，她自己睡下去，精力才回得来
+NAP_WAKE = 60.0    # 歇到这里且人已回来就醒，别赖在瞌睡态
 
 
 def emblem(draw: ImageDraw.ImageDraw, cx: float, cy: float, radius: float, spin: float) -> None:
@@ -201,6 +205,7 @@ class Pet:
         self.said_this_hour: list[float] = []
         self.qoder_gone_since: float | None = None
         self.paused = False
+        self.quitting = False
         self.qoder_hwnd = 0
         self.pid = winutil.kernel32.GetCurrentProcessId()
         self.placed_at = (-9999, -9999)
@@ -229,6 +234,7 @@ class Pet:
         self.next_slow = 0.0
         self.next_save = self.session_start + self.cfg["save_every_seconds"]
         self.next_speech = self.session_start + self.rng.uniform(12, 24)
+        self.menu = self.build_menu()
         self.bind_events()
 
         offline = self.life.apply_offline()
@@ -266,6 +272,11 @@ class Pet:
         self.head: dict[str, tuple[float, float]] = {}
         self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
         self.sheet: Image.Image | None = None
+        # 旧尺寸的画片与轮廓要一起作废，否则改大小后的第一帧还按旧剪影判点击落在哪
+        self.current = None
+        self.live_step = -1
+        self.live_at: tuple | None = None
+        self.live_photo = None
         rig_file = FRAMES_DIR / "rig.json"
         self.rig = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
         self.cycles = self.cfg.get("cycle_seconds") or {}
@@ -321,6 +332,10 @@ class Pet:
             if other != state:
                 del self.cells[other]
                 self.head.pop(other, None)
+                # photos 必须跟 cells 一起走：留着已卸载状态的键，下一次缓存命中
+                # 就会在 render 里踩 KeyError，而那是能把整个动画循环停掉的位置。
+                for key in [k for k in self.photos if k[0] == other]:
+                    del self.photos[key]
         return cells
 
     def render(self, state: str, index: int, gaze: int, live: float | None = None) -> ImageTk.PhotoImage:
@@ -333,9 +348,10 @@ class Pet:
         if live is None:
             key = (state, index, gaze)
             photo = self.photos.get(key)
-            if photo is not None:
+            cached = self.cells.get(state)
+            if photo is not None and cached is not None:
                 # keep the silhouette we test clicks against in step with what is drawn
-                self.current = self.cells[state][index % len(self.cells[state])]
+                self.current = cached[index % len(cached)]
                 return photo
         else:
             step = int(live * LIFE_HZ)
@@ -412,12 +428,26 @@ class Pet:
     # ---------- main loop ----------
 
     def loop(self) -> None:
+        # 续期放在异常之外：一次抛错就把动画永久停掉，比直接崩掉难查得多——
+        # 她的标准输出被哨兵丢弃，停摆时现场什么都留不下。
+        try:
+            delay = self.tick_once()
+        except Exception:
+            traceback.print_exc()
+            delay = None
+        if self.quitting:
+            return
+        self.root.after(int((delay if delay is not None else FAST_TICK) * 1000), self.loop)
+
+    def tick_once(self) -> float | None:
         now = time.time()
         if self.paused:
-            self.root.after(500, self.loop)
+            # 让路期间也按 1Hz 结算，否则两小时全屏会变成一次性扣款
+            self.life.tick((now - self.last_life) / 60.0)
+            self.last_life = now
             if not winutil.fullscreen_foreground(self.pid, self.qoder_hwnd):
                 self.resume()
-            return
+            return PAUSED_TICK
         self.animate(now)
         if now >= self.next_slow:
             self.next_slow = now + SLOW_TICK
@@ -425,18 +455,32 @@ class Pet:
             self.last_life = now
             if winutil.fullscreen_foreground(self.pid, self.qoder_hwnd):
                 self.pause()
-                self.root.after(500, self.loop)   # 必须续期，否则挂起后再也没人唤醒她
-                return
+                return PAUSED_TICK      # 挂起后也得有人继续唤醒她
             hwnd = winutil.qoder_main_window()
             self.qoder_hwnd = hwnd or 0
-            self.refresh_perch(hwnd)
+            if self.cfg.get("follow_qoder", True):
+                self.refresh_perch(hwnd)   # 关掉就是不跟着窗走：站定在出生那次算好的位置
             self.life.note_context(*self.foreground())
             self.check_hover(now)
+            self.check_nap()
             if self.check_qoder(now, hwnd):
-                return
+                return None
         self.schedule_speech(now)
         self.persist(now)
-        self.root.after(int(FAST_TICK * 1000), self.loop)
+        return None
+
+    def check_nap(self) -> None:
+        """精力见底又没人理，她自己睡下去；主人回来且歇够了，她自己醒。
+        入睡和唤醒必须都在这一处自动：只接睡不接醒，她就会在屏幕前一路睡到精力封顶，
+        而心情和好奇还在按三分之一的速度漏，看着又像坏了。"""
+        idle = winutil.idle_seconds()
+        if self.life.sleeping:
+            if idle < self.cfg["idle_user_seconds"] and self.life.needs["energy"] >= NAP_WAKE:
+                self.life.sleeping = False
+                self.force("waving", 1.2)
+            return
+        if self.life.needs["energy"] < NAP_ENERGY and idle > self.cfg["idle_user_seconds"]:
+            self.life.sleeping = True
 
     def foreground(self) -> tuple[str, str]:
         title = winutil.foreground_title()
@@ -577,9 +621,13 @@ class Pet:
     def resume(self) -> None:
         self.paused = False
         self.root.deiconify()
+        self.placed_at = (-9999, -9999)   # geometry() repaints a key-colour window
+        if self.pinned:
+            # 位置是他给的，让一次路不该把它要回去；只重画，不回位
+            self.place()
+            return
         self.refresh_perch(winutil.qoder_main_window(), force=True)
         self.x, self.y = self.anchor, self.floor
-        self.placed_at = (-9999, -9999)
         self.place()
 
     # ---------- perch and watchdog ----------
@@ -590,6 +638,8 @@ class Pet:
             return
         if force or not self.pinned:
             left, top, width, height = winutil.window_rect(hwnd)
+            if left < -30000 or top < -30000:
+                return   # 最小化窗口的矩形在屏幕外，跟着走她就再也回不来
             offset_x, offset_y = self.cfg["perch_offset"]
             self.anchor = float(left + width - self.frame_size[0] + offset_x)
             self.floor = float(top + height - self.frame_size[1] + offset_y)
@@ -611,18 +661,28 @@ class Pet:
     def schedule_speech(self, now: float) -> None:
         if now < self.next_speech or now < self.silent_until or self.cfg.get("muted"):
             return
+        self.said_this_hour = [t for t in self.said_this_hour if now - t < 3600]
+        if self.in_quiet_hours() or len(self.said_this_hour) >= self.cfg["speech_max_per_hour"]:
+            return
+        text = self.context_line(now)
+        if not text:
+            # 没词可说就别把这一整个发言窗口白吞掉；隔几秒再试，不用按帧重试
+            self.next_speech = now + 5.0
+            return
+        self.said_this_hour.append(now)
         self.next_speech = now + self.rng.uniform(
             self.cfg["speech_min_gap_seconds"], self.cfg["speech_min_gap_seconds"] * 2.5
         )
-        if datetime.now().hour in self.cfg.get("quiet_hours", []):
-            return
-        self.said_this_hour = [t for t in self.said_this_hour if now - t < 3600]
-        if len(self.said_this_hour) >= self.cfg["speech_max_per_hour"]:
-            return
-        text = self.context_line(now)
-        if text:
-            self.said_this_hour.append(now)
-            self.show_bubble(text)
+        self.show_bubble(text)
+
+    def in_quiet_hours(self) -> bool:
+        """quiet_hours 是一段时段 [起, 止)，不是两个整点；起 > 止时按跨零点算。"""
+        hours = self.cfg.get("quiet_hours") or []
+        hour = datetime.now().hour
+        if len(hours) < 2:
+            return hour in hours
+        start, end = hours[0], hours[1]
+        return start <= hour < end if start <= end else hour >= start or hour < end
 
     def context_line(self, now: float) -> str | None:
         needs = self.life.needs
@@ -641,6 +701,8 @@ class Pet:
             return self.speech.pick("sense", "long_work", **variables)
         if datetime.now().hour in (0, 1, 2, 3) and needs["energy"] < 55:
             return self.speech.pick("sense", "night_owl", **variables)
+        if needs["affection"] > 80:
+            return self.speech.pick("needs", "high_affection", **variables)
         roll = self.rng.random()
         if roll < 0.24:
             return self.speech.pick("state", self.state.split("-")[0])
@@ -648,6 +710,8 @@ class Pet:
             return self.speech.pick("self", self.rng.choice(["memory", "aware", "identity"]))
         if roll < 0.62 and variables.get("file"):
             return self.speech.pick("sense", "coding", **variables)
+        if roll < 0.72 and self.qoder_hwnd and not self.pinned:
+            return self.speech.pick("sense", "qoder")
         return self.speech.pick("greet", self.hour_bucket(), **variables)
 
     def hour_bucket(self) -> str:
@@ -682,6 +746,8 @@ class Pet:
             text = self.speech.pick("greet", "first_meet")
         elif offline_minutes > 45:
             text = self.speech.pick("greet", "back_long", **self.line_vars())
+        elif offline_minutes > 5:
+            text = self.speech.pick("greet", "back_short", **self.line_vars())
         else:
             text = self.speech.pick("greet", self.hour_bucket(), **self.line_vars())
         if text:
@@ -933,7 +999,10 @@ class Pet:
 
     def on_feed(self, event=None) -> None:
         self.cancel_long_press()
-        self.swallow_release = True  # the release after the second press is not another pat
+        if event is not None:
+            # 第二次按下后面那下的松开不是又一次摸头；从菜单进来没有这次松开可吞，
+            # 无条件置位会把她下一次真实拖拽的收尾一起吃掉。
+            self.swallow_release = True
         self.life.stats["feeds"] += 1
         self.life.bump("mood", 9.0)
         self.life.bump("energy", 12.0)
@@ -976,26 +1045,31 @@ class Pet:
         self.last_watched = now
         self.say(self.speech.pick("touch", "watched", **self.line_vars()))
 
-    def on_menu(self, event) -> None:
+    def build_menu(self) -> tk.Menu:
+        """只建一次：每右键 new 一个 Menu 会让 Tk 控件一路累积，长时间挂机就是个泄漏。"""
         menu = tk.Menu(self.root, tearoff=0)
         menu.add_command(label="喂食", command=self.on_feed)
         menu.add_command(label="摸头", command=self.on_pet)
         menu.add_command(label="让她跳一下", command=lambda: self.force("jumping", 1.6))
         menu.add_command(label="把她放到桌面上", command=self.drop_to_desk)
-        menu.add_command(
-            label="叫醒她" if self.life.sleeping else "让她小睡", command=self.toggle_sleep
-        )
-        menu.add_command(
-            label="取消静音" if self.cfg.get("muted") else "别说话", command=self.toggle_mute
-        )
-        menu.add_command(
-            label="回到 Qoder 窗边" if self.pinned else "钉在当前位", command=self.toggle_pin
-        )
+        menu.add_command(label="让她小睡", command=self.toggle_sleep)
+        menu.add_command(label="别说话", command=self.toggle_mute)
+        menu.add_command(label="钉在当前位", command=self.toggle_pin)
         menu.add_command(label="看看数值", command=self.show_status)
         menu.add_command(label="写日记", command=self.write_diary_now)
         menu.add_separator()
         menu.add_command(label="退出（本次 Qoder 期间不再自动回来）", command=self.quit)
-        menu.tk_popup(event.x_root, event.y_root)
+        return menu
+
+    def refresh_menu(self) -> None:
+        """文案在弹出的这一刻求值，不然小睡/静音/钉住三项会停在第一次打开时的样子。"""
+        self.menu.entryconfig(4, label="叫醒她" if self.life.sleeping else "让她小睡")
+        self.menu.entryconfig(5, label="取消静音" if self.cfg.get("muted") else "别说话")
+        self.menu.entryconfig(6, label="回到 Qoder 窗边" if self.pinned else "钉在当前位")
+
+    def on_menu(self, event) -> None:
+        self.refresh_menu()
+        self.menu.tk_popup(event.x_root, event.y_root)
 
     def toggle_sleep(self) -> None:
         self.life.sleeping = not self.life.sleeping
@@ -1043,6 +1117,7 @@ class Pet:
             write_diary(APP / "diary", self.life, date.today())
 
     def quit(self, intent: bool = True) -> None:
+        self.quitting = True   # 只有这条路允许动画循环不再续期
         if intent:
             (APP / "run").mkdir(exist_ok=True)
             (APP / "run" / "quit").write_text(str(int(time.time())), encoding="utf-8")

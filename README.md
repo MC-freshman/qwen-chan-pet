@@ -151,8 +151,9 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠�
 
 ## 隐私
 
-只读前台窗口标题和本地输入空闲时长，全部在本机判定，不联网、不上传、不写日志。
-剪贴板默认不读（`allow_clipboard: false`）。`save.json` 含你的使用画像，已在 `.gitignore` 里。
+只读前台窗口标题和本地输入空闲时长，全部在本机判定，不联网、不上传。
+本机只写三样：`save.json`（养成数值与使用画像，已在 `.gitignore` 里）、`diary/` 的每日一句、
+`run/pet.err.log`（她出错时的堆栈，超过 256KB 自动清空，不然定格这种事查不到原因）。
 
 ## 版权
 

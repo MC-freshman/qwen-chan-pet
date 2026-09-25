@@ -45,15 +45,22 @@ def pet_pid() -> int:
 def start_pet() -> None:
     DETACHED_PROCESS = 0x00000008
     CREATE_NO_WINDOW = 0x08000000
-    subprocess.Popen(
-        [sys.executable, str(PET)],
-        cwd=str(APP),
-        creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
-        close_fds=True,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+    log_path = RUN / "pet.err.log"
+    if log_path.exists() and log_path.stat().st_size > 256 * 1024:
+        log_path.write_text("", encoding="utf-8")   # 别让它无声地长满盘
+    log = open(log_path, "ab")
+    try:
+        subprocess.Popen(
+            [sys.executable, str(PET)],
+            cwd=str(APP),
+            creationflags=DETACHED_PROCESS | CREATE_NO_WINDOW,
+            close_fds=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log,   # 异常只进 DEVNULL 的话，她定格时现场什么都查不到
+        )
+    finally:
+        log.close()
 
 
 def main() -> None:
