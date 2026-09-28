@@ -413,6 +413,8 @@ def main() -> None:
         encoding="utf-8",
     )
     print(f"sheet {sheet.size} -> {OUT / 'spritesheet.webp'}")
+    print("注意：运行侧读的是 app/assets/spritesheet.webp，这一步不会搬过去；"
+          "要出成品帧与落位请跑 build_motion.py（它才是一致的那条路）")
     verify()
 
 

@@ -8,6 +8,7 @@
     7
   ],
   "follow_qoder": true,
+  "requires_qoder": true,
   "perch_offset": [
     -40,
     -18
@@ -31,5 +32,21 @@
     "shy": 2.6,
     "annoyed": 3.2,
     "dizzy": 1.6
-  }
+  },
+  "boss_window_keywords": [
+    "bilibili",
+    "youtube",
+    "爱奇艺",
+    "腾讯视频",
+    " Netflix",
+    "steam",
+    "minecraft",
+    "原神",
+    "崩坏"
+  ],
+  "boss_cooldown_minutes": 30,
+  "signal_cooldown_seconds": 60,
+  "tts_enabled": false,
+  "tts_voice": "",
+  "tts_rate": 0
 }

@@ -14,6 +14,15 @@ powershell -File app/install-startup.ps1   # 可选：注册开机自启
 powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
 ```
 
+**完全独立启动（当前配置）**
+
+```powershell
+pythonw E:\桌宠\qwen娘\app\pet.pyw
+```
+
+这条命令不经过 sentinel、不绑定 Qoder，也不会注册开机启动；位置固定在桌面右下角。
+开关保存在 `app/config.local.json` 的 `requires_qoder` / `follow_qoder`。
+
 **当 Qoder 内置桌宠**：把 `app/assets/spritesheet.webp` 和下面这个 `pet.json` 放进
 `~/.petdex/pets/qwen-chan/`，再到 Qoder 桌宠设置里刷新选择。
 
@@ -138,6 +147,9 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠�
 精灵表 `1536×1872`：8 列 × 9 行，每格 `192×208`，行序
 `idle / running-right / running-left / waving / jumping / failed / waiting / running / review`。
 
+当前 idle 源图是 `poses/qwen-chibi-idle_20260927_v2.png`：双手自然下垂、扇子放在身侧，
+避免旧版待机一直举手造成的招手感。改源图后重新运行 `python build_motion.py` 即可同步独立帧和精灵表。
+
 三个**反应专用态** `shy / annoyed / dizzy` 只出 `app/frames/`，不进精灵表——九行是 Qoder 包的硬契约。
 运行时按目录发现它们（`extra_states`），缺帧就退回最近的烘焙态，所以 Qoder 那份不会崩。
 `python build_motion.py shy annoyed dizzy` 只重建这几个状态（顺带保留 `rig.json` 里其余条目）。
@@ -158,3 +170,12 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠�
 ## 版权
 
 形象基于通义千问非官方吉祥物二创，最先由B站up主生成，仅供个人学习与本地使用；原始参考立绘未纳入本仓库。
+
+## 2026-09-26 改进批次（P 表 Q0-Q5）
+
+- **状态过渡**（Q1）：进入任何状态不再硬切——0.40s 的"落座"包络（旧姿态单侧淡出 + 正弦形变暗示），12 态全部覆盖，最坏过渡步 ≤ 硬切的 65%（`tools/probe_transition.py`）。精灵图路线的结构底线：transparentcolor 键控要求 alpha 二值化，逐像素双向交叉淡变不可用（详见 LEDGER）。
+- **信号源**（Q3）：接入 `E:\桌宠\signals\` 目录协议。agent 跑任务（qoder.busy）、跑完（qoder.done）、前台白名单（boss）都会让她开口；新增台词 18 句。
+- **防重复**（Q2）：台词 157 → **273** 句；历史窗 12→40；环境类子键 4h 分类级冷却；反应态（shy/annoyed/dizzy）台词改走独立通道。7 天模拟 48h 窗口重复率 0%（selftest H 项）。
+- **语音**（Q4）：SAPI5 离线 TTS（Huihui），与 grok娘 同款模块；`tts_enabled/tts_voice/tts_rate` 配置。**2026-09-27 起 `tts_enabled` 默认关**（用户要求静音；气泡文字照常，要出声把它改回 true）。
+- **自检闸门**（Q0）：`python app/selftest.py`——8+1 项无头检查（占位符/触发面/去重/衰减/离线上限/存档/日记/48h 重复率），改台词或数值后先跑它。
+- **Qoder hook**：与 grok娘 共用 `desktop-pet-signals@local` 插件（信号目录 E:\桌宠\signals），Qoder 重启后生效。

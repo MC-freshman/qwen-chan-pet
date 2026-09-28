@@ -264,6 +264,13 @@ class LifeLayer:
         self.turn_from = 0.0
         self.turn_until = 0.0
         self.turn_dir = 1.0
+        # Q5a 微动作：东张西望（三连扫视，4-8 分钟一次）与伸懒腰（6-10 分钟一次）
+        self.next_glance = self.t0 + self.random.uniform(240.0, 480.0)
+        self.glance_until = 0.0
+        self.glance_seq: list[tuple[float, float, float]] = []
+        self.next_stretch = self.t0 + self.random.uniform(360.0, 600.0)
+        self.stretch_from = 0.0
+        self.stretch_until = 0.0
         self.eye_row: float | None = None
         self.chin_row: float | None = None
 
@@ -286,12 +293,50 @@ class LifeLayer:
             + 0.11 * math.sin(t * 1.73 + 1.1)
         ) * 2.4 * unit
         profile = simple_pendulum(height, height * 0.66, sway, rigid_above=height * 0.30)
-        turn = self._turn(now, unit)
-        if turn:
+        glance = self._glance_turn(now, unit)
+        turn = self._turn(now, unit) if glance == 0.0 else 0.0
+        if glance:
+            profile = profile + head_follow_profile(
+                height, self.chin_row, glance, shoulder=26.0 * unit
+            )
+        elif turn:
             profile = profile + head_follow_profile(
                 height, self.chin_row, turn, shoulder=26.0 * unit
             )
         return profile
+
+    def _glance_turn(self, now: float, unit: float) -> float:
+        """东张西望：左右各扫一眼的连贯小动作（三段正弦，段间连续）。"""
+        if now >= self.next_glance and now >= self.glance_until:
+            self.glance_until = now + 2.4
+            step = 0.8
+            self.glance_seq = []
+            base = self.random.choice((-1.0, 1.0))
+            for k in range(3):
+                start = now + k * step
+                self.glance_seq.append(
+                    (start, start + step, base if k % 2 == 0 else -base))
+            self.next_glance = self.glance_until + self.random.uniform(240.0, 480.0)
+        for start, end, direction in self.glance_seq:
+            if start <= now < end:
+                progress = (now - start) / (end - start)
+                return direction * 2.2 * unit * math.sin(math.pi * progress)
+        return 0.0
+
+    def stretch(self, now: float) -> float | None:
+        """伸懒腰：躯干带缓慢纵向拉伸的正弦包络；未激活返回 None。"""
+        if now >= self.next_stretch:
+            self.stretch_from = now
+            self.stretch_until = now + 1.8
+            self.next_stretch = self.stretch_until + self.random.uniform(360.0, 600.0)
+        if self.stretch_from <= now < self.stretch_until:
+            progress = (now - self.stretch_from) / (self.stretch_until - self.stretch_from)
+            return 1.0 + 0.02 * math.sin(math.pi * progress)
+        return None
+
+    def stretch_band(self, height: int) -> tuple[float, float]:
+        # 中段躯干带：带下缘以下的内容只位移 ~2px，脚不滑
+        return (height * 0.36, height * 0.68)
 
     def breath(self, now: float) -> float:
         t = now - self.t0

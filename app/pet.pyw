@@ -19,8 +19,9 @@ from pathlib import Path
 import numpy as np
 
 import rigor
+import tts
 import winutil
-from needs import Life, write_diary
+from needs import NAP_ENERGY, NAP_WAKE, Life, write_diary, write_weekly
 from speech import Speech
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -58,8 +59,18 @@ ZONE_STATE = {
     "body": ("waving", "waving"),
 }
 DEFAULT_CYCLE = 2.0
-PHOTO_CACHE = 420
-RESIDENT_STATES = 6
+# Q3 信号目录协议（与 grok娘 共享）：hook 写文件、桌宠轮询、TTL 内有效。
+# 冷却内的同类事件按爆发去重直接丢弃；频控挡住的留到下一轮或 TTL 作废。
+SIGNALS_DIR = ROOT if (ROOT := None) else __import__("pathlib").Path(__file__).resolve().parent.parent / "signals"
+SIGNAL_KINDS = {"qoder.busy": "qoder_busy", "qoder.done": "qoder_done"}
+SIGNAL_TTL_SECONDS = 120.0
+# Q1 状态过渡：进入新姿态的"落座"包络时长。0.25-0.4 之间，肉眼是"坐进去"，
+# 不是硬切也不是慢动作。
+TRANSITION_SECONDS = 0.40
+# 常驻按字节算而不是按态的个数算：一态 16-24 帧、每帧 RGBA 是 w*h*4。
+# 0.8 缩放 + 175% DPI 下 12 个态约 90MB，全留得住；滚到 1.6 倍就只剩得下三个态。
+RESIDENT_BYTES = 96 * 1024 * 1024
+PHOTO_BYTES_PER_STATE = 24 * 1024 * 1024
 MAGIC = "#ff00fe"
 # The window is refreshed at 30fps; the runtime deformation only at this rate, because
 # a deformed frame is unique and costs ~7ms while the extra ticks only need her position.
@@ -72,8 +83,56 @@ BUBBLE_FONT = "C:/Windows/Fonts/msyh.ttc"
 FAST_TICK = 1 / 30
 SLOW_TICK = 1.0
 PAUSED_TICK = 0.5  # 全屏让路时的唤醒节奏：不看帧，只要有人继续叫她
-NAP_ENERGY = 12.0  # 低于这条线又没人理，她自己睡下去，精力才回得来
-NAP_WAKE = 60.0    # 歇到这里且人已回来就醒，别赖在瞌睡态
+
+
+def face_rows(spec: dict, height: float) -> tuple[float, float]:
+    """这个姿势的眼睛行与下巴行；rig.json 缺项时退回整格比例。"""
+    return ((spec.get("eye") or 0.39) * height, (spec.get("chin") or 0.46) * height)
+
+
+def zone_for_point(x: float, y: float, height: float, eye: float, chin: float,
+                   row_left: int | None, row_right: int | None) -> str:
+    """分区判据本体。row_left/row_right 是这一行剪影的实际左右边界，None 表示整行透明。
+
+    头发不是画出来的区域而是"贴着轮廓边缘的那一圈"，所以必须拿到当行的跨度才能判；
+    把它做成入参而不是在这里读像素，判定才能脱离 PIL 和 Tk 被喂矩阵。
+    """
+    if y < eye - height * 0.05:
+        return "hat"
+    if y < chin + height * 0.03:
+        return "face"
+    if y < height * 0.74 and row_left is not None:
+        edge = height * 0.06
+        if x <= row_left + edge or x >= row_right - edge:
+            return "hair"
+    if y > height * 0.62:
+        return "skirt"
+    return "body"
+
+
+def pat_outcome(streak: int, mood: float, fed_up_at: int = 6, gloomy_below: float = 30.0) -> tuple:
+    """第几下、心情什么档 -> (分支, 亲密增量, 心情增量, 好奇增量)。
+
+    第三下起收益减半是 README 的口径；连点翻脸排在"心情太低先拒绝"之前，
+    否则蔫着的她就永远进不了 annoyed 那条分支。
+    """
+    if streak >= fed_up_at:
+        return ("annoyed", 0.5, -1.5, 0.0)
+    if mood < gloomy_below:
+        return ("reject", 1.0, 2.0, 0.0)
+    gain = 1.0 if streak <= 2 else 0.5
+    return ("pat", 4.0 * gain, 2.0 * gain, 1.0)
+
+
+def velocity_from_trace(trace: list, min_span: float = 0.02) -> tuple[float, float]:
+    """最近一段拖拽轨迹的平均速度（像素/秒），够短或样本不足时返回 0。"""
+    if len(trace) < 2:
+        return 0.0, 0.0
+    first, last = trace[0], trace[-1]
+    span = last[0] - first[0]
+    if span < min_span:
+        return 0.0, 0.0
+    return (last[1] - first[1]) / span, (last[2] - first[2]) / span
 
 
 def emblem(draw: ImageDraw.ImageDraw, cx: float, cy: float, radius: float, spin: float) -> None:
@@ -159,6 +218,26 @@ def head_anchor(cell: Image.Image) -> tuple[float, float]:
     return float(xs[band].mean()), float(top + (bottom - top) * 0.06)
 
 
+class StateCache:
+    """一个态的全部缓存：帧、头部锚点、按 (帧号, 视线) 记的画片。
+
+    三者必须同生同死。过去帧表和画片表各有独立上限，画片能活过它所属的帧，
+    于是"命中一张已卸载的帧"就是一次 KeyError——而它抛出的位置正好在动画循环续期之前。
+    """
+
+    __slots__ = ("frames", "head", "photos", "photo_bytes")
+
+    def __init__(self, frames: list[Image.Image], head: tuple[float, float]) -> None:
+        self.frames = frames
+        self.head = head
+        self.photos: dict[tuple[int, int], ImageTk.PhotoImage] = {}
+        self.photo_bytes = 0
+
+    @property
+    def frame_bytes(self) -> int:
+        return len(self.frames) * self.frames[0].width * self.frames[0].height * 4
+
+
 class Pet:
     def __init__(self, config: dict) -> None:
         self.cfg = config
@@ -222,6 +301,17 @@ class Pet:
         self.airborne = False
         self.squash = 0.0
         self.lean = 0.0
+        # 过渡包络：enter_state/force 时起跳，render 里随时间衰减成"落座"形变
+        self.trans_until = 0.0
+        self.trans_lean = 0.0
+        self.trans_squash = 0.0
+        self.trans_from = None       # 旧姿态最后一帧，交叉溶解用
+        self.signal_cool: dict = {}  # Q3: per-kind 台词冷却
+        self.boss_cool = 0.0
+        self.tts = tts.TTS(APP / "tts_cache",
+                           enabled=bool(config.get("tts_enabled", True)),
+                           voice=config.get("tts_voice", ""),
+                           rate=int(config.get("tts_rate", 0) or 0))
         self.tickle_until = 0.0
         self.touches: list[float] = []
         self.pointer_on_her_since = 0.0
@@ -268,9 +358,7 @@ class Pet:
             max(1, round(DISPLAY_BASE[0] * self.pixel_scale)),
             max(1, round(DISPLAY_BASE[1] * self.pixel_scale)),
         )
-        self.cells: dict[str, list[Image.Image]] = {}
-        self.head: dict[str, tuple[float, float]] = {}
-        self.photos: dict[tuple[str, int, int], ImageTk.PhotoImage] = {}
+        self.cache: dict[str, StateCache] = {}
         self.sheet: Image.Image | None = None
         # 旧尺寸的画片与轮廓要一起作废，否则改大小后的第一帧还按旧剪影判点击落在哪
         self.current = None
@@ -299,10 +387,10 @@ class Pet:
         cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         return cell
 
-    def load_state(self, state: str) -> list[Image.Image]:
-        """Frames are ~10MB per state, so keep only the few most recent resident."""
-        cached = self.cells.get(state)
-        if cached:
+    def load_state(self, state: str) -> StateCache:
+        """帧很贵（一态十几 MB），所以按字节预算常驻，超了整态丢掉。"""
+        cached = self.cache.get(state)
+        if cached is not None:
             return cached
         folder = FRAMES_DIR / state
         files = sorted(folder.glob("*.png")) if folder.is_dir() else []
@@ -324,19 +412,27 @@ class Pet:
             ]
             charm_free = False
         cells = [self.prepare(image, charm_free) for image in raw]
-        self.head[state] = head_anchor(cells[0])
-        self.cells[state] = cells
-        for other in list(self.cells):
-            if len(self.cells) <= RESIDENT_STATES:
-                break
-            if other != state:
-                del self.cells[other]
-                self.head.pop(other, None)
-                # photos 必须跟 cells 一起走：留着已卸载状态的键，下一次缓存命中
-                # 就会在 render 里踩 KeyError，而那是能把整个动画循环停掉的位置。
-                for key in [k for k in self.photos if k[0] == other]:
-                    del self.photos[key]
-        return cells
+        self.cache[state] = entry = StateCache(cells, head_anchor(cells[0]))
+        self.balance(state)
+        return entry
+
+    def balance(self, keep: str) -> None:
+        """按字节逐出：刚载入的那个一定留着，其余按进来的顺序整态丢。"""
+        while len(self.cache) > 1:
+            used = sum(entry.frame_bytes for entry in self.cache.values())
+            if used <= RESIDENT_BYTES:
+                return
+            for other in list(self.cache):
+                if other != keep:
+                    del self.cache[other]
+                    break
+
+    def head_row(self, state: str) -> tuple[float, float]:
+        """她的头在这个格子里的哪一格；该态没在内存时退回格子中央偏上。"""
+        resident = self.cache.get(state)
+        if resident is not None:
+            return resident.head
+        return (self.frame_size[0] / 2.0, self.frame_size[1] * 0.2)
 
     def render(self, state: str, index: int, gaze: int, live: float | None = None) -> ImageTk.PhotoImage:
         """One drawn frame. `live` is the wall clock for the life layer.
@@ -346,20 +442,35 @@ class Pet:
         quantised to LIFE_HZ and the extra ticks reuse the picture she is already in.
         """
         if live is None:
-            key = (state, index, gaze)
-            photo = self.photos.get(key)
-            cached = self.cells.get(state)
-            if photo is not None and cached is not None:
-                # keep the silhouette we test clicks against in step with what is drawn
-                self.current = cached[index % len(cached)]
-                return photo
+            resident = self.cache.get(state)
+            if resident is not None:
+                # 画片按"归一化后的帧号"记：越界的 index 画的是同一帧，不该占两个键位
+                key = (index % len(resident.frames), gaze)
+                photo = resident.photos.get(key)
+                if photo is not None:
+                    # keep the silhouette we test clicks against in step with what is drawn
+                    self.current = resident.frames[key[0]]
+                    return photo
         else:
             step = int(live * LIFE_HZ)
             if step == self.live_step and (state, index, gaze) == self.live_at:
                 return self.live_photo
             self.live_step, self.live_at = step, (state, index, gaze)
-        cells = self.load_state(state)
-        cell = cells[index % len(cells)]
+        resident = self.load_state(state)
+        cell = resident.frames[index % len(resident.frames)]
+        # Q1 交叉溶解：姿态切换瞬间，先画"几乎还是旧姿态"，再在过渡窗内淡入
+        # 新姿态——精灵图整幅换图的硬切被摊成逐帧小步，无需为新资产出桥接帧
+        if live is not None and live < self.trans_until and self.trans_from is not None                 and self.trans_from.size == cell.size:
+            beta = max(0.0, min(1.0, (self.trans_until - live) / TRANSITION_SECONDS))
+            if beta > 0:
+                # 单侧淡出：旧姿态按 beta 淡出、叠在新姿态上层。Tk 的
+                # transparentcolor 键控要求最终 alpha 二值化（HARD_ALPHA），
+                # 任何中途半透明的双向溶解都会被打成闪烁孔洞——精灵图路线的
+                # 交叉淡变只能做单侧。旧轮廓遮不到的新姿态突出部分会在首帧
+                # 显形，这是该路线的结构底线（2.5D 网格路线没有此限制）
+                faded_old = self.trans_from.copy()
+                faded_old.putalpha(faded_old.getchannel("A").point(lambda a: int(a * beta)))
+                cell = Image.alpha_composite(cell, faded_old)
         height = cell.height
         unit = height / DISPLAY_BASE[1]
         # Every horizontal runtime effect is a per-row shift, so they add into one
@@ -367,7 +478,7 @@ class Pet:
         # because the frames are rendered at 2x the cell they were designed in.
         profile = None
         if gaze:
-            hx, hy = self.head[state]
+            hx, hy = resident.head
             chin_row = (self.rig.get(state) or {}).get("chin")
             chin = chin_row * height if chin_row else hy + height * 0.24
             profile = rigor.head_follow_profile(height, chin, gaze * 1.6, shoulder=26.0 * unit)
@@ -379,28 +490,44 @@ class Pet:
             # smears, which is how the baked frames behaved before.
             lean = rigor.simple_pendulum(height, height * 0.92, self.lean, rigid_above=height * 0.30)
             profile = lean if profile is None else profile + lean
+        eff_squash = self.squash
+        if live is not None and live < self.trans_until:
+            # 正弦包络：形变从 0 起峰再回 0，切换瞬间和结束瞬间都连续——
+            # 若从全幅衰减起步，形变本身就成了一次新的跳变
+            progress = 1.0 - max(0.0, min(1.0, (self.trans_until - live) / TRANSITION_SECONDS))
+            amp = math.sin(math.pi * progress)
+            lean = rigor.simple_pendulum(height, height * 0.92,
+                                         self.trans_lean * amp, rigid_above=height * 0.30)
+            profile = lean if profile is None else profile + lean
+            eff_squash = max(eff_squash, self.trans_squash * amp)
         if profile is not None:
             cell = rigor.shear_rows_fast(cell, profile)
         if live is not None:
             cell = rigor.band_scale_fast(cell, height * 0.36, height * 0.68, self.layer.breath(live))
+            stretch = self.layer.stretch(live)
+            if stretch is not None:
+                sband = self.layer.stretch_band(height)
+                cell = rigor.band_scale_fast(cell, sband[0], sband[1], stretch)
             blink = self.layer.blink(live)
             band = self.layer.blink_band(height) if blink != 1.0 else None
             if band:
                 cell = rigor.band_scale_fast(cell, band[0], band[1], blink)
-        if self.squash:
+        if eff_squash:
             # Landing compresses her from the feet up, with the body bulging to match.
-            cell = rigor.squash_stretch(cell, 1.0 - self.squash, height - 1)
-        if profile is not None or live is not None or self.squash:
+            cell = rigor.squash_stretch(cell, 1.0 - eff_squash, height - 1)
+        if profile is not None or live is not None or eff_squash:
             cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         self.current = cell
         flat = Image.new("RGB", cell.size, (255, 0, 254))
         flat.paste(cell, (0, 0), cell)
         photo = ImageTk.PhotoImage(flat)
         if live is None:
-            self.photos[key] = photo
-            while len(self.photos) > PHOTO_CACHE:
-                self.photos.pop(next(iter(self.photos)))  # oldest first: dropping them all
-                # at once costs a full repaint pass and shows up as a hitch.
+            resident.photos[(index % len(resident.frames), gaze)] = photo
+            resident.photo_bytes += flat.width * flat.height * 3   # ImageTk 那张是 RGB
+            while resident.photo_bytes > PHOTO_BYTES_PER_STATE and len(resident.photos) > 2:
+                del resident.photos[next(iter(resident.photos))]   # 丢最老的，一次一张
+                # 全丢光会换来一整轮重绘，读起来就是一下顿挫
+                resident.photo_bytes -= flat.width * flat.height * 3
         else:
             self.live_photo = photo
         return photo
@@ -461,6 +588,7 @@ class Pet:
             if self.cfg.get("follow_qoder", True):
                 self.refresh_perch(hwnd)   # 关掉就是不跟着窗走：站定在出生那次算好的位置
             self.life.note_context(*self.foreground())
+            self.poll_signals(now)
             self.check_hover(now)
             self.check_nap()
             if self.check_qoder(now, hwnd):
@@ -494,7 +622,7 @@ class Pet:
         self.physics(dt)
         self.move(now, dt)
         self.update_gaze(now)
-        cells = self.load_state(self.state)
+        cells = self.load_state(self.state).frames
         # Time-driven playback: how long a loop lasts belongs to the action, not to
         # the frame count or to how often Tk happens to wake us. Waving used to run
         # its 8 frames at whatever the tick was, which read as a 0.5s shiver.
@@ -504,6 +632,7 @@ class Pet:
             self.state in CALM_STATES
             or self.airborne
             or now < self.tickle_until
+            or now < self.trans_until
             or abs(self.squash) > 0.004
             or abs(self.lean) > 0.05
         )
@@ -514,9 +643,27 @@ class Pet:
         if self.bubble is not None:
             self.position_bubble()
 
+    def start_transition(self, state: str, now: float) -> None:
+        """进入新姿态的"落座"：抓下旧姿态最后一帧做交叉溶解，再叠加朝运动
+        方向的小幅倾身与压缩。幅度刻意小——她是在换姿势，不是在表演。"""
+        self.trans_until = now + TRANSITION_SECONDS
+        self.trans_from = self.current.copy() if self.current is not None else None
+        direction = 0.0
+        if "left" in state:
+            direction = -1.0
+        elif "right" in state:
+            direction = 1.0
+        elif state == "running":
+            direction = self.rng.choice((-1.0, 1.0))
+        # 振幅压到"察觉到重量变化"的水平：交叉溶解负责姿态跳变，包络只补
+        # 一点惯性暗示。大了会在 20Hz 生命层量化下每步移动近十像素，反而扎眼
+        self.trans_lean = direction * self.rng.uniform(0.018, 0.032)
+        self.trans_squash = 0.02 if state == "jumping" else 0.012
+
     def enter_state(self, state: str, now: float) -> None:
         if MIRROR_PAIR.get(self.state) != state:
             self.state_started = now  # 跑到边界掉头时沿用步幅相位，不重新起步
+            self.start_transition(state, now)
         self.state = state
         self.state_until = now + self.dwell(state)
         self.sync_landmarks()
@@ -529,7 +676,7 @@ class Pet:
         if winutil.idle_seconds() > 6.0:
             self.gaze = 0
             return
-        hx, hy = self.head.get(self.state, (self.frame_size[0] / 2, self.frame_size[1] * 0.2))
+        hx, hy = self.head_row(self.state)
         cursor_x, _ = winutil.cursor_pos()
         offset = cursor_x - (self.x + hx)
         self.gaze = max(-3, min(3, int(round(offset / 110))))
@@ -561,7 +708,8 @@ class Pet:
         elif self.x < self.anchor - limit:
             if self.state != "running-right":
                 self.state = "running-right"
-        self.x = max(-20, min(self.root.winfo_screenwidth() - 30, self.x))
+        # 右边按她的实际宽度夹：写死一个 30 的话，1.04 缩放下她能走到只剩 30 像素看得见
+        self.x = max(-20, min(self.root.winfo_screenwidth() - self.frame_size[0], self.x))
 
     def choose_state(self, now: float) -> str:
         if now < self.forced_until and self.forced_state:
@@ -596,10 +744,18 @@ class Pet:
         states = list(weights)
         return self.rng.choices(states, [weights[s] for s in states])[0]
 
-    def react(self, wanted: str, fallback: str, seconds: float = 1.4) -> None:
+    def react(self, wanted: str, fallback: str, seconds: float = 1.4) -> bool:
         """Prefer the dedicated reaction pose; use a baked one when its frames are not
-        installed - the Qoder package only ever ships the nine contract rows."""
-        self.force(wanted if wanted in self.extra_states else fallback, seconds)
+        installed - the Qoder package only ever ships the nine contract rows.
+        独立反应态（shy/annoyed/dizzy）有自己的台词通道：直接说 state/<名>，
+        不走 schedule_speech 的 240s 频控——返回 True 表示本函数已说过话。"""
+        standalone = wanted in self.extra_states
+        self.force(wanted if standalone else fallback, seconds)
+        if standalone:
+            text = self.speech.pick("state", wanted, **self.line_vars())
+            if text:
+                self.say(text)
+        return standalone
 
     def force(self, state: str, seconds: float = 1.5) -> None:
         self.forced_state = state
@@ -607,6 +763,7 @@ class Pet:
         self.state = state
         self.state_started = time.time()
         self.state_until = self.forced_until
+        self.start_transition(state, time.time())
         self.sync_landmarks()
 
     # ---------- fullscreen courtesy ----------
@@ -635,6 +792,13 @@ class Pet:
     def refresh_perch(self, hwnd: int | None = None, force: bool = False) -> None:
         hwnd = hwnd or winutil.qoder_main_window()
         if not hwnd:
+            if not self.cfg.get("requires_qoder", True):
+                # Standalone mode: park at the lower-right work-area corner and
+                # keep this anchor even when Qoder is absent.
+                left, top, right, bottom = winutil.work_area()
+                offset_x, offset_y = self.cfg.get("standalone_offset", [-40, -18])
+                self.anchor = float(right - self.frame_size[0] + offset_x)
+                self.floor = float(bottom - self.frame_size[1] + offset_y)
             return
         if force or not self.pinned:
             left, top, width, height = winutil.window_rect(hwnd)
@@ -646,6 +810,9 @@ class Pet:
 
     def check_qoder(self, now: float, hwnd: int | None = None) -> bool:
         """She only exists while Qoder is open — covers crash and force-kill too."""
+        if not self.cfg.get("requires_qoder", True):
+            self.qoder_gone_since = None
+            return False
         if hwnd or winutil.qoder_main_window():
             self.qoder_gone_since = None
             return False
@@ -655,6 +822,58 @@ class Pet:
             self.quit(intent=False)   # 不是他让我走的，别把这个记成"别再回来"
             return True
         return False
+
+    # ---------- agent signals ----------
+
+    def _read_signal(self, path):
+        """只读：内容合法且未过期返回 dict，过期则删文件并返回 None。"""
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            data = {}
+        try:
+            ts = float(data.get("ts", 0))
+        except (TypeError, ValueError):
+            ts = 0.0
+        if time.time() - ts > SIGNAL_TTL_SECONDS:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            return None
+        return data
+
+    def poll_signals(self, now: float) -> None:
+        cool = self.cfg.get("signal_cooldown_seconds", 60)
+        for fname, cat in SIGNAL_KINDS.items():
+            path = SIGNALS_DIR / fname
+            sig = self._read_signal(path)
+            if sig is None:
+                continue
+            if now - self.signal_cool.get(cat, 0) <= cool:
+                try:
+                    path.unlink()   # 冷却内同类=爆发去重，丢弃
+                except OSError:
+                    pass
+                continue
+            text = self.speech.pick(cat, **self.line_vars())
+            if text:
+                self.signal_cool[cat] = now
+                try:
+                    path.unlink()   # 说到才删
+                except OSError:
+                    pass
+                self.say(text)
+        kws = self.cfg.get("boss_window_keywords") or []
+        if kws and now - self.boss_cool > self.cfg.get("boss_cooldown_minutes", 30) * 60:
+            title = (winutil.foreground_title() or "").lower()
+            if title and any(k.lower() in title for k in kws):
+                text = self.speech.pick("boss", **self.line_vars())
+                if text:
+                    self.boss_cool = now
+                    self.say(text)
 
     # ---------- speech ----------
 
@@ -780,7 +999,7 @@ class Pet:
         if self.bubble is None:
             return
         width, height, tip_x, tip_y = self.bubble_box
-        hx, hy = self.head.get(self.state, (self.frame_size[0] / 2, self.frame_size[1] * 0.2))
+        hx, hy = self.head_row(self.state)
         x = int(self.x + hx - tip_x)
         y = int(self.y + hy - tip_y - 3 * self.pixel_scale)
         x = max(4, min(x, self.root.winfo_screenwidth() - width - 4))
@@ -804,6 +1023,7 @@ class Pet:
     def say(self, text: str | None) -> None:
         if text and not self.cfg.get("muted"):
             self.show_bubble(text)
+            self.tts.speak(text)
             self.said_this_hour.append(time.time())
             self.next_speech = time.time() + self.cfg["speech_min_gap_seconds"]
 
@@ -816,25 +1036,16 @@ class Pet:
             return None
         if cell.getpixel((x, y))[3] < 128:
             return None
-        height = cell.height
-        spec = self.rig.get(self.state) or {}
-        eye = (spec.get("eye") or 0.39) * height
-        chin = (spec.get("chin") or 0.46) * height
-        if y < eye - height * 0.05:
-            return "hat"
-        if y < chin + height * 0.03:
-            return "face"
+        eye, chin = face_rows(self.rig.get(self.state) or {}, cell.height)
         # Hair is whatever hangs off the edge of her silhouette, which moves with the
         # pose - a fixed fraction of the cell missed the strands entirely while waving.
-        if y < height * 0.74:
+        row_left = row_right = None
+        if y < cell.height * 0.74:
             strip = np.asarray(cell.crop((0, y, cell.width, y + 1)).getchannel("A")) > 128
             span = np.flatnonzero(strip)
-            edge = height * 0.06
-            if span.size and (x <= span[0] + edge or x >= span[-1] - edge):
-                return "hair"
-        if y > height * 0.62:
-            return "skirt"
-        return "body"
+            if span.size:
+                row_left, row_right = int(span[0]), int(span[-1])
+        return zone_for_point(x, y, cell.height, eye, chin, row_left, row_right)
 
     def on_hover(self, event) -> None:
         """She notices a pointer that parks on her; the slow tick decides if it stayed."""
@@ -909,14 +1120,7 @@ class Pet:
         self.say(self.speech.pick("touch", "drag", **self.line_vars()))
 
     def throw_velocity(self) -> tuple[float, float]:
-        samples = self.drag_trace
-        if len(samples) < 2:
-            return 0.0, 0.0
-        first, last = samples[0], samples[-1]
-        span = last[0] - first[0]
-        if span < 0.02:
-            return 0.0, 0.0
-        return (last[1] - first[1]) / span, (last[2] - first[2]) / span
+        return velocity_from_trace(self.drag_trace)
 
     def throw(self, velocity_x: float, velocity_y: float) -> None:
         self.pinned = True
@@ -968,34 +1172,30 @@ class Pet:
         now = time.time()
         self.touches = [touched for touched in self.touches if now - touched < 3.0]
         self.touches.append(now)
-        streak = len(self.touches)
+        branch, affection, mood, curiosity = pat_outcome(len(self.touches), self.life.needs["mood"])
         self.life.stats["pets"] += 1
         self.life.sleeping = False
-        if streak >= 6:
-            self.life.bump("mood", -1.5)
-            self.life.bump("affection", 0.5)
+        if branch == "annoyed":
+            self.life.bump("mood", mood)
+            self.life.bump("affection", affection)
             self.react("annoyed", "failed", 1.6)
             self.say(self.speech.pick("touch", "annoyed", **self.line_vars()))
             return
-        if self.life.needs["mood"] < 30:
-            # She is too gloomy to show it, but the contact still registers: the mood
-            # gain is the same as a happy pat, only the reaction differs. Gating the
-            # reward behind the mood floor is how she stayed pinned at zero forever.
-            self.life.bump("mood", 2.0)
-            self.life.bump("affection", 1.0)
+        if branch == "reject":
+            self.life.bump("mood", mood)
+            self.life.bump("affection", affection)
             self.force("failed", 1.4)
             self.say(self.speech.pick("touch", "reject", **self.line_vars()))
             return
-        # the fifth pat in a row is worth less than the first
-        gain = 1.0 if streak <= 2 else 0.5
-        self.life.bump("affection", 4.0 * gain)
-        self.life.bump("mood", 2.0 * gain)
-        self.life.bump("curiosity", 1.0)
+        self.life.bump("affection", affection)
+        self.life.bump("mood", mood)
+        self.life.bump("curiosity", curiosity)
         if zone == "hat":
             self.lean = 5.0
         wanted, fallback = ZONE_STATE.get(zone, ("waving", "waving"))
-        self.react(wanted, fallback, 1.4)
-        self.say(self.speech.pick("touch", zone) or self.speech.pick("touch", "pet"))
+        spoke = self.react(wanted, fallback, 1.4)
+        if not spoke:
+            self.say(self.speech.pick("touch", zone) or self.speech.pick("touch", "pet"))
 
     def on_feed(self, event=None) -> None:
         self.cancel_long_press()
@@ -1115,6 +1315,9 @@ class Pet:
         if self.life.diary_day != today and datetime.now().hour >= 4:
             self.life.diary_day = today
             write_diary(APP / "diary", self.life, date.today())
+            # Q5b: 周一凌晨顺手把上周的账结了
+            if date.today().weekday() == 0:
+                write_weekly(APP / "diary", self.life, date.today())
 
     def quit(self, intent: bool = True) -> None:
         self.quitting = True   # 只有这条路允许动画循环不再续期
@@ -1124,8 +1327,16 @@ class Pet:
         self.life.save()
         try:
             self.cfg.pop("muted", None)
-            (APP / "config.local.json").write_text(
-                json.dumps({"scale": self.cfg["scale"]}, ensure_ascii=False, indent=2),
+            local_path = APP / "config.local.json"
+            local = {}
+            if local_path.exists():
+                try:
+                    local = json.loads(local_path.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    local = {}
+            local["scale"] = self.cfg["scale"]
+            local_path.write_text(
+                json.dumps(local, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
         except OSError:

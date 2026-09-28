@@ -190,10 +190,12 @@ def face_lines(content: Image.Image) -> dict:
     """Locate the eyes as the only row band with two separated dark clusters.
 
     Fraction-of-art-height guesses land on the hat, which is what smeared the brim.
+    这里过去先把左上角 88x152 抹掉再找眼睛——那是给表里的挂饰留的位子，可成品帧根本不画
+    挂饰，于是镜像态上这块盖住的是她自己的头发，检不出眼睛就悄悄不眨眼。
+    实测 12 个态摘掉这块遮罩后检出值一字不变（含 running-left 的 205/231）。
     """
     arr = np.array(content.convert("RGB")).astype(int)
     alpha = np.array(content.getchannel("A"))
-    alpha[: MASK_BOX[0], : MASK_BOX[1]] = 0
     ys, _ = np.nonzero(alpha)
     if len(ys) == 0:
         return {"eye": content.height * 0.2, "chin": content.height * 0.3}
@@ -402,9 +404,47 @@ def sheet_cell(frame: Image.Image) -> Image.Image:
     return frame.resize((SHEET_W, SHEET_H), Image.Resampling.LANCZOS)
 
 
+def measure_shipped() -> int:
+    """只测量、一个字节都不写：把 app/frames 里现有成品帧对着安全框读一遍。
+
+    过去"验一次安全框"等于"删写 141 张 PNG"，所以没人愿意随手验。
+    """
+    worst = {"left": 999, "top": 999, "right": 999, "bottom": 999}
+    bad: list[str] = []
+    total = 0
+    for state, count in FRAMES.items():
+        paths = sorted((OUT_FRAMES / state).glob("*.png"))
+        if len(paths) != count:
+            bad.append("%s: 盘上 %d 帧，合同应有 %d 帧" % (state, len(paths), count))
+        for path in paths:
+            box = Image.open(path).getchannel("A").getbbox()
+            if box is None:
+                bad.append("空帧 " + str(path))
+                continue
+            total += 1
+            worst["left"] = min(worst["left"], box[0])
+            worst["top"] = min(worst["top"], box[1])
+            worst["right"] = min(worst["right"], CELL_W - box[2])
+            worst["bottom"] = min(worst["bottom"], CELL_H - box[3])
+            if not fits(box):
+                bad.append("%s/%s 越出安全框 box=%s" % (state, path.name, box))
+    print("%d 帧已量，最紧边距 %s（要求 左右≥%d、上≥%d、下≥%d）"
+          % (total, worst, SAFE_SIDE, SAFE_TOP, FOOT_MARGIN))
+    for line in bad[:20]:
+        print("  问题：", line)
+    print("  共 %d 处" % len(bad) if bad else "  全部合格")
+    return 1 if bad else 0
+
+
 def main() -> None:
     cycles = cycle_seconds()
-    only = set(sys.argv[1:])
+    flags = {a for a in sys.argv[1:] if a.startswith("--")}
+    unknown_flags = flags - {"--check"}
+    if unknown_flags:
+        raise SystemExit(f"不认识这些开关：{sorted(unknown_flags)}；可用：--check")
+    only = set(sys.argv[1:]) - flags
+    if "--check" in flags:
+        raise SystemExit(measure_shipped())
     unknown = only - set(FRAMES)
     if unknown:
         raise SystemExit(f"没有这些状态：{sorted(unknown)}；可选：{sorted(FRAMES)}")
@@ -450,11 +490,13 @@ def main() -> None:
                 # a Qoder pet window has no life layer running under it.
                 sprite = scaled[stride_frame(state, index)]
                 if mirrored:
-                    # 挂饰钉在格子左上角、不参与镜像：先只出画片，翻完再把挂饰垫在她后面
+                    # 挂饰钉在格子左上角、不参与镜像：先只出画片，翻完再把挂饰垫在她后面。
+                    # 摆幅要跟着身体反号——画片反了，挂饰却仍按向右甩的话，向左跑时
+                    # 她会看到挂饰朝运动的反方向荡。
                     plain = animate(state, index, count, sprite, springs, cycle,
                                     charm=False, baked_life=True)
                     charming = Image.new("RGBA", (CELL_W, CELL_H), (0, 0, 0, 0))
-                    charming.alpha_composite(charm_layer(state, motion_at(state, index, count)[0]),
+                    charming.alpha_composite(charm_layer(state, -motion_at(state, index, count)[0]),
                                              (CHARM_X, 0))
                     charming.alpha_composite(plain.transpose(Image.Transpose.FLIP_LEFT_RIGHT))
                 else:

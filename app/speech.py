@@ -14,11 +14,17 @@ def _placeholders(text: str) -> set[str]:
     return {name for _, name, _, _ in _FORMAT.parse(text) if name}
 
 
+# 环境类台词启用分类级冷却；互动类（touch）重复是互动的一部分，不冷却
+AMBIENT = {"greet", "state", "self", "sense", "needs"}
+
+
 class Speech:
-    def __init__(self, path: Path, life, rng: random.Random | None = None):
+    def __init__(self, path: Path, life, rng: random.Random | None = None,
+                 subkey_gap_seconds: float = 4 * 3600):
         self.tree = json.loads(Path(path).read_text(encoding="utf-8"))
         self.life = life
         self.rng = rng or random.Random()
+        self.subkey_gap_seconds = subkey_gap_seconds
 
     def candidates(self, category: str, sub: str | None = None) -> list[tuple[str, str]]:
         group = self.tree.get(category, {})
@@ -31,6 +37,10 @@ class Speech:
 
     def pick(self, category: str, sub: str | None = None, **variables) -> str | None:
         """Return one line whose placeholders we can actually fill, avoiding repeats."""
+        if category in AMBIENT and sub:
+            key = f"{category}/{sub}"
+            if self.life.subkey_recent(key, self.subkey_gap_seconds):
+                return None
         recent = self.life.recent_lines()
         pool = []
         for line_id, text in self.candidates(category, sub):
@@ -43,4 +53,6 @@ class Speech:
         fresh = [item for item in pool if not item[2]]
         line_id, text, _ = self.rng.choice(fresh or pool)
         self.life.remember_line(line_id)
+        if category in AMBIENT:
+            self.life.note_subkey(f"{category}/{sub}" if sub else category)
         return text.format(**variables)

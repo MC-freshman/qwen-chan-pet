@@ -8,5 +8,10 @@ app/diary/
 app/config.local.json
 app/run/
 
+# 打包产物与合成语音缓存：二进制一旦进 public 历史就很难干净移除
+qwen娘独立启动.exe
+build_launcher/
+app/tts_cache/
+
 # 探针：第三方模型与 npm 依赖不入库（Live2D 示例/Bongo 猫模型均有授权限制）
 probe/
