@@ -7,8 +7,9 @@
     0,
     7
   ],
-  "follow_qoder": true,
-  "requires_qoder": true,
+  "follow_qoder": false,
+  "requires_qoder": false,
+  "bind_qoder": false,
   "perch_offset": [
     -40,
     -18

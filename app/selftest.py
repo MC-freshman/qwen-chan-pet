@@ -13,7 +13,6 @@ import random
 import string
 import sys
 import tempfile
-import time
 from datetime import date
 from pathlib import Path
 

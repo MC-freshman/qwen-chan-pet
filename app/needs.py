@@ -112,8 +112,11 @@ class Life:
     def tick(self, minutes: float) -> None:
         if minutes <= 0:
             return
-        _, used = settle(minutes, self.sleeping)
-        self._drain(minutes)
+        # 上限只认 settle 一处：过去这里算了一遍带夹取的增量、又拿没夹取的分钟数去
+        # _drain，于是心跳路径绕过了"离线路径 12 小时封顶"那条修复。
+        deltas, used = settle(minutes, self.sleeping)
+        for key, delta in deltas.items():
+            self.needs[key] = _clamp(self.needs[key] + delta)
         # "一起在线"只在心跳这条路上记：她睡着的那几个小时不该算成陪伴
         self.stats["minutes_online"] = self.stats.get("minutes_online", 0) + used
         self.last_seen = time.time()

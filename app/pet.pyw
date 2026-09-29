@@ -27,24 +27,10 @@ from speech import Speech
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 
 APP = Path(__file__).resolve().parent
-SHEET = APP / "assets" / "spritesheet.webp"
 FRAMES_DIR = APP / "frames"
-# The Qoder package sheet is 8 columns x 9 rows of 192x208. app/frames/ holds the
-# same states at a higher render resolution, so the cell size comes from disk.
-SHEET_CELL = (192, 208)
-SHEET_CELLS = 8
-DISPLAY_BASE = (192, 208)  # what one sheet cell is worth on screen at scale 1.0
-ROW_STATES = [
-    "idle",
-    "running-right",
-    "running-left",
-    "waving",
-    "jumping",
-    "failed",
-    "waiting",
-    "running",
-    "review",
-]
+# app/frames/ 是唯一素材来源（Qoder 精灵表那条线已删）。一格在 scale=1.0 时值这么多
+# 逻辑像素——帧本身是 384x416 出的，这里记的是它想还原成原设计尺度的那份比例。
+DISPLAY_BASE = (192, 208)
 MIRROR_PAIR = {"running-right": "running-left", "running-left": "running-right"}
 # States quiet enough to carry the runtime life layer; the moving ones already have
 # their own choreography baked in.
@@ -61,8 +47,9 @@ ZONE_STATE = {
 DEFAULT_CYCLE = 2.0
 # Q3 信号目录协议（与 grok娘 共享）：hook 写文件、桌宠轮询、TTL 内有效。
 # 冷却内的同类事件按爆发去重直接丢弃；频控挡住的留到下一轮或 TTL 作废。
-SIGNALS_DIR = ROOT if (ROOT := None) else __import__("pathlib").Path(__file__).resolve().parent.parent / "signals"
-SIGNAL_KINDS = {"qoder.busy": "qoder_busy", "qoder.done": "qoder_done"}
+# 目录是 E:\桌宠\signals（README 与 hook_writer.py 都按这个约定写），不是本项目下的。
+SIGNALS_DIR = APP.parent.parent / "signals"
+SIGNAL_KINDS = {"qoder.busy": "qoder_busy", "qoder.done": "qoder_done", "boss": "boss"}
 SIGNAL_TTL_SECONDS = 120.0
 # Q1 状态过渡：进入新姿态的"落座"包络时长。0.25-0.4 之间，肉眼是"坐进去"，
 # 不是硬切也不是慢动作。
@@ -208,8 +195,9 @@ def render_bubble(text: str, scale: float, swing: float = 0.0) -> tuple[Image.Im
 
 def head_anchor(cell: Image.Image) -> tuple[float, float]:
     """Where her head sits inside a cell, so the bubble tail points at her and not at empty space."""
-    mask = np.array(cell.getchannel("A"), dtype=np.uint8).copy()
-    mask[: round(cell.height * 0.21), : round(cell.width * 0.27)] = 0  # the charm, not her
+    # 这里过去先把左上角 21%x27% 抹掉，那是给精灵表里的挂饰留的位子。成品帧根本不画
+    # 挂饰，实测 12 个态摘掉这块遮罩后锚点一字不变（差 0.0, 0.0）——留着只会误导。
+    mask = np.array(cell.getchannel("A"), dtype=np.uint8)
     ys, xs = np.nonzero(mask)
     if len(ys) == 0:
         return cell.width / 2, cell.height * 0.2
@@ -219,18 +207,21 @@ def head_anchor(cell: Image.Image) -> tuple[float, float]:
 
 
 class StateCache:
-    """一个态的全部缓存：帧、头部锚点、按 (帧号, 视线) 记的画片。
+    """一个态的全部缓存：帧、头部锚点、按 (帧号, 视线) 记的画片与其真实剪影。
 
-    三者必须同生同死。过去帧表和画片表各有独立上限，画片能活过它所属的帧，
+    四者必须同生同死。过去帧表和画片表各有独立上限，画片能活过它所属的帧，
     于是"命中一张已卸载的帧"就是一次 KeyError——而它抛出的位置正好在动画循环续期之前。
+    alphas 存的是画出去那张的 alpha（带视线剪切），点她的时候要用画的那张判命中，
+    不然视线一偏，能碰到的轮廓就和看到的错开几个像素。
     """
 
-    __slots__ = ("frames", "head", "photos", "photo_bytes")
+    __slots__ = ("frames", "head", "photos", "alphas", "photo_bytes")
 
     def __init__(self, frames: list[Image.Image], head: tuple[float, float]) -> None:
         self.frames = frames
         self.head = head
         self.photos: dict[tuple[int, int], ImageTk.PhotoImage] = {}
+        self.alphas: dict[tuple[int, int], Image.Image] = {}
         self.photo_bytes = 0
 
     @property
@@ -258,8 +249,8 @@ class Pet:
 
         self.dpi = winutil.system_scale()
         self.set_scale(self.cfg["scale"])
-        # Standalone-only reaction poses (shy / annoyed / dizzy): they are not part of
-        # the Qoder nine-row contract, so the pet discovers them from the frames folder.
+        # 她能演哪些态由盘上有什么决定（shy / annoyed / dizzy 这三个反应态也是在这里
+        # 被发现的），所以素材只出一半也能先跑起来，不会为缺的态抛错
         self.extra_states = {
             path.name for path in FRAMES_DIR.iterdir() if path.is_dir()
         } if FRAMES_DIR.is_dir() else set()
@@ -276,11 +267,12 @@ class Pet:
         self.pinned = False
         self.drag_anchor = None
         self.moved = 0
+        self.moved_px = 0
+        self.pointer_last = (0, 0)
         self.bubble = None
         self.bubble_label = None
         self.bubble_photo = None
         self.bubble_box = (0, 0, 0, 0)
-        self.silent_until = 0.0
         self.said_this_hour: list[float] = []
         self.qoder_gone_since: float | None = None
         self.paused = False
@@ -308,16 +300,23 @@ class Pet:
         self.trans_from = None       # 旧姿态最后一帧，交叉溶解用
         self.signal_cool: dict = {}  # Q3: per-kind 台词冷却
         self.boss_cool = 0.0
+        # config.local.json 是人手编辑的：tts_rate 写成 "fast" 时这里int()会抛，
+        # 而她还没建窗口——表现就是"启动即崩"。读不进就按 0（引擎默认语速）。
+        try:
+            tts_rate = int(config.get("tts_rate", 0) or 0)
+        except (TypeError, ValueError):
+            tts_rate = 0
         self.tts = tts.TTS(APP / "tts_cache",
                            enabled=bool(config.get("tts_enabled", True)),
-                           voice=config.get("tts_voice", ""),
-                           rate=int(config.get("tts_rate", 0) or 0))
+                           voice=str(config.get("tts_voice", "") or ""),
+                           rate=tts_rate)
         self.tickle_until = 0.0
         self.touches: list[float] = []
         self.pointer_on_her_since = 0.0
         self.last_watched = 0.0
         self.swallow_release = False
         self.current: Image.Image | None = None
+        self.current_alpha: Image.Image | None = None
         self.live_step = -1
         self.live_at: tuple | None = None
         self.live_photo = None
@@ -359,9 +358,9 @@ class Pet:
             max(1, round(DISPLAY_BASE[1] * self.pixel_scale)),
         )
         self.cache: dict[str, StateCache] = {}
-        self.sheet: Image.Image | None = None
         # 旧尺寸的画片与轮廓要一起作废，否则改大小后的第一帧还按旧剪影判点击落在哪
         self.current = None
+        self.current_alpha = None
         self.live_step = -1
         self.live_at: tuple | None = None
         self.live_photo = None
@@ -369,20 +368,8 @@ class Pet:
         self.rig = json.loads(rig_file.read_text(encoding="utf-8")) if rig_file.exists() else {}
         self.cycles = self.cfg.get("cycle_seconds") or {}
 
-    def sheet_image(self) -> Image.Image:
-        """Opened on demand: app/frames/ can be missing or mid-rebuild, and the
-        sheet is the fallback for exactly those moments."""
-        if self.sheet is None:
-            self.sheet = Image.open(SHEET).convert("RGBA")
-        return self.sheet
-
-    def prepare(self, image: Image.Image, charm_free: bool) -> Image.Image:
+    def prepare(self, image: Image.Image) -> Image.Image:
         cell = image.resize(self.frame_size, Image.Resampling.LANCZOS)
-        # The sheet's charm hangs from the cell top, which has no ceiling here; it now
-        # dangles from the speech bubble instead. app/frames/ ships without it, so
-        # only the sheet path pays for finding and dropping it.
-        if not charm_free:
-            cell = rigor.drop_detached(cell, round(cell.height * 0.24), round(cell.width * 0.38))
         # A key-colour window cannot blend, so harden the silhouette edge.
         cell.putalpha(cell.getchannel("A").point(HARD_ALPHA))
         return cell
@@ -392,26 +379,13 @@ class Pet:
         cached = self.cache.get(state)
         if cached is not None:
             return cached
-        folder = FRAMES_DIR / state
-        files = sorted(folder.glob("*.png")) if folder.is_dir() else []
-        if files:
-            raw = [Image.open(path) for path in files]
-            charm_free = True
-        else:
-            row = (ROW_STATES.index(state) if state in ROW_STATES else ROW_STATES.index("idle")) * SHEET_CELL[1]
-            raw = [
-                self.sheet_image().crop(
-                    (
-                        col * SHEET_CELL[0],
-                        row,
-                        (col + 1) * SHEET_CELL[0],
-                        row + SHEET_CELL[1],
-                    )
-                )
-                for col in range(SHEET_CELLS)
-            ]
-            charm_free = False
-        cells = [self.prepare(image, charm_free) for image in raw]
+        files = sorted((FRAMES_DIR / state).glob("*.png"))
+        if not files:
+            # 少一个态不该让她停摆（loop() 只把抛错写进日志），退回待机帧，
+            # 但要把名字喊出来——静默替身是最难查的那种像
+            print(f"缺 {state} 的帧目录，用 idle 顶上", file=sys.stderr)
+            files = sorted((FRAMES_DIR / "idle").glob("*.png"))
+        cells = [self.prepare(Image.open(path)) for path in files]
         self.cache[state] = entry = StateCache(cells, head_anchor(cells[0]))
         self.balance(state)
         return entry
@@ -450,12 +424,15 @@ class Pet:
                 if photo is not None:
                     # keep the silhouette we test clicks against in step with what is drawn
                     self.current = resident.frames[key[0]]
+                    self.current_alpha = resident.alphas.get(key)
                     return photo
         else:
             step = int(live * LIFE_HZ)
             if step == self.live_step and (state, index, gaze) == self.live_at:
                 return self.live_photo
-            self.live_step, self.live_at = step, (state, index, gaze)
+        # 走到这里就要真的画一张。缓存键必须等画成功再登记：先登记后抛错的话，
+        # 下面每次都命中"还是这一帧"，她定格在旧图上且不再抛第二次错。
+        self.current_alpha = None
         resident = self.load_state(state)
         cell = resident.frames[index % len(resident.frames)]
         # Q1 交叉溶解：姿态切换瞬间，先画"几乎还是旧姿态"，再在过渡窗内淡入
@@ -522,14 +499,20 @@ class Pet:
         flat.paste(cell, (0, 0), cell)
         photo = ImageTk.PhotoImage(flat)
         if live is None:
-            resident.photos[(index % len(resident.frames), gaze)] = photo
-            resident.photo_bytes += flat.width * flat.height * 3   # ImageTk 那张是 RGB
+            key = (index % len(resident.frames), gaze)
+            per_key = flat.width * flat.height * 4   # 画片 RGB 3 字节 + 剪影 L 1 字节
+            resident.photos[key] = photo
+            resident.alphas[key] = cell.getchannel("A")
+            resident.photo_bytes += per_key
             while resident.photo_bytes > PHOTO_BYTES_PER_STATE and len(resident.photos) > 2:
-                del resident.photos[next(iter(resident.photos))]   # 丢最老的，一次一张
+                oldest = next(iter(resident.photos))     # 丢最老的，一次一张
+                del resident.photos[oldest]
+                resident.alphas.pop(oldest, None)
                 # 全丢光会换来一整轮重绘，读起来就是一下顿挫
-                resident.photo_bytes -= flat.width * flat.height * 3
+                resident.photo_bytes -= per_key
         else:
             self.live_photo = photo
+            self.live_step, self.live_at = step, (state, index, gaze)
         return photo
 
     def sync_landmarks(self) -> None:
@@ -878,7 +861,7 @@ class Pet:
     # ---------- speech ----------
 
     def schedule_speech(self, now: float) -> None:
-        if now < self.next_speech or now < self.silent_until or self.cfg.get("muted"):
+        if now < self.next_speech or self.cfg.get("muted"):
             return
         self.said_this_hour = [t for t in self.said_this_hour if now - t < 3600]
         if self.in_quiet_hours() or len(self.said_this_hour) >= self.cfg["speech_max_per_hour"]:
@@ -904,34 +887,49 @@ class Pet:
         return start <= hour < end if start <= end else hour >= start or hour < end
 
     def context_line(self, now: float) -> str | None:
+        """按优先级试到第一条"真的拿到词"的分支为止。
+
+        speech.pick 对 AMBIENT 分类有 4 小时的子键冷却，冷却期内返回 None。旧写法是
+        命中分支就 return，于是一句 needs/low_energy 就把整条台词链静音四小时——此刻
+        greet/sense/self 的池子还是满的。selftest 的 H 项一直按"首选被挡住就再试"建模。
+        """
         needs = self.life.needs
         variables = self.line_vars()
+        ladder: list[tuple[str, str]] = []
         if (now - self.session_start) < 60 and self.offline_gap > 45:
-            return self.speech.pick("greet", "back_long", **variables)
+            ladder.append(("greet", "back_long"))
         if needs["energy"] < 22:
-            return self.speech.pick("needs", "low_energy", **variables)
+            ladder.append(("needs", "low_energy"))
         if needs["mood"] < 28:
-            return self.speech.pick("needs", "low_mood", **variables)
+            ladder.append(("needs", "low_mood"))
         if needs["affection"] < 20:
-            return self.speech.pick("needs", "low_affection", **variables)
+            ladder.append(("needs", "low_affection"))
         if winutil.idle_seconds() > self.cfg["idle_user_seconds"]:
-            return self.speech.pick("sense", "user_idle", **variables)
+            ladder.append(("sense", "user_idle"))
         if (now - self.session_start) / 60 > self.cfg["long_work_minutes"]:
-            return self.speech.pick("sense", "long_work", **variables)
+            ladder.append(("sense", "long_work"))
         if datetime.now().hour in (0, 1, 2, 3) and needs["energy"] < 55:
-            return self.speech.pick("sense", "night_owl", **variables)
+            ladder.append(("sense", "night_owl"))
         if needs["affection"] > 80:
-            return self.speech.pick("needs", "high_affection", **variables)
+            ladder.append(("needs", "high_affection"))
         roll = self.rng.random()
         if roll < 0.24:
-            return self.speech.pick("state", self.state.split("-")[0])
-        if roll < 0.44:
-            return self.speech.pick("self", self.rng.choice(["memory", "aware", "identity"]))
-        if roll < 0.62 and variables.get("file"):
-            return self.speech.pick("sense", "coding", **variables)
-        if roll < 0.72 and self.qoder_hwnd and not self.pinned:
-            return self.speech.pick("sense", "qoder")
-        return self.speech.pick("greet", self.hour_bucket(), **variables)
+            # 先按整态名找（向左跑有一组自己的话），被冷却挡住再折进 running
+            ladder.append(("state", self.state))
+            ladder.append(("state", self.state.split("-")[0]))
+        elif roll < 0.44:
+            ladder.append(("self", self.rng.choice(["memory", "aware", "identity"])))
+        elif roll < 0.62 and variables.get("file"):
+            ladder.append(("sense", "coding"))
+        elif roll < 0.72 and self.qoder_hwnd and not self.pinned:
+            ladder.append(("sense", "qoder"))
+        else:
+            ladder.append(("greet", self.hour_bucket()))
+        for category, sub in ladder:
+            text = self.speech.pick(category, sub, **variables)
+            if text:
+                return text
+        return None
 
     def hour_bucket(self) -> str:
         hour = datetime.now().hour
@@ -990,7 +988,8 @@ class Pet:
         self.bubble_gen = getattr(self, "bubble_gen", 0) + 1
         generation = self.bubble_gen
         self.position_bubble()
-        self.bubble_id = top.after(
+        # 不存 after 的 id：换气泡时旧定时器靠 generation 自己作废
+        top.after(
             int((seconds or self.cfg["bubble_seconds"]) * 1000),
             lambda: self.hide_bubble(generation),
         )
@@ -1034,14 +1033,16 @@ class Pet:
         cell = self.current
         if cell is None or not (0 <= x < cell.width and 0 <= y < cell.height):
             return None
-        if cell.getpixel((x, y))[3] < 128:
+        # 视线剪切过的轮廓：缓存命中那张画的是剪过的，用没剪的底图判会错开几个像素
+        alpha = self.current_alpha if self.current_alpha is not None else cell.getchannel("A")
+        if alpha.getpixel((x, y)) < 128:
             return None
         eye, chin = face_rows(self.rig.get(self.state) or {}, cell.height)
         # Hair is whatever hangs off the edge of her silhouette, which moves with the
         # pose - a fixed fraction of the cell missed the strands entirely while waving.
         row_left = row_right = None
         if y < cell.height * 0.74:
-            strip = np.asarray(cell.crop((0, y, cell.width, y + 1)).getchannel("A")) > 128
+            strip = np.asarray(alpha.crop((0, y, cell.width, y + 1))).reshape(-1) > 128
             span = np.flatnonzero(strip)
             if span.size:
                 row_left, row_right = int(span[0]), int(span[-1])
@@ -1060,6 +1061,8 @@ class Pet:
         self.drag_anchor = (event.x_root - int(self.x), event.y_root - int(self.y))
         self.drag_trace = [(self.press_at, event.x_root, event.y_root)]
         self.moved = 0
+        self.moved_px = 0
+        self.pointer_last = (event.x_root, event.y_root)
         self.airborne = False
         self.velocity = (0.0, 0.0)
         self.cancel_long_press()
@@ -1091,6 +1094,11 @@ class Pet:
         self.x = event.x_root - self.drag_anchor[0]
         self.y = event.y_root - self.drag_anchor[1]
         self.moved += 1
+        # 位移按像素累加：moved 数的是 <B1-Motion> 事件的个数，跟鼠标轮询率走。
+        # 甩掷旧写法要求 moved>60，一次 0.2s 的快甩只够 20-30 个事件，永远甩不出去。
+        self.moved_px += abs(event.x_root - self.pointer_last[0]) + abs(
+            event.y_root - self.pointer_last[1])
+        self.pointer_last = (event.x_root, event.y_root)
         now = time.time()
         self.drag_trace.append((now, event.x_root, event.y_root))
         self.drag_trace = [sample for sample in self.drag_trace if now - sample[0] < 0.2]
@@ -1109,7 +1117,11 @@ class Pet:
                 self.on_pet(self.press_zone)
             return
         velocity_x, velocity_y = self.throw_velocity()
-        if abs(velocity_x) > 320 or abs(velocity_y) > 320:
+        # 阈值 320 会把正常速度的拖动（300-800px/s）也判成甩——提到 1200，
+        # 且要求合速度（不是分轴），轻拖不再起飞
+        speed = (velocity_x ** 2 + velocity_y ** 2) ** 0.5
+        # 1500px/s 且拖动位移 ≥60px：轻拖/微调永远不会触发甩
+        if speed > 1500 and self.moved_px > 60:
             self.throw(velocity_x, velocity_y)
             return
         self.pinned = True
@@ -1258,18 +1270,32 @@ class Pet:
         menu.add_command(label="看看数值", command=self.show_status)
         menu.add_command(label="写日记", command=self.write_diary_now)
         menu.add_separator()
-        menu.add_command(label="退出（本次 Qoder 期间不再自动回来）", command=self.quit)
+        # 独立模式下 run/quit 由哨兵在自己启动时清掉，所以有效期是"本次开机"而不是
+        # "本次 Qoder 会话"——文案要说清是哪一种，不然他以为点一次就永久安静了。
+        menu.add_command(
+            label="退出（本次 Qoder 期间不再自动回来）" if self.cfg.get("bind_qoder")
+            else "退出（本次开机期间不再自动回来）",
+            command=self.quit)
         return menu
 
     def refresh_menu(self) -> None:
         """文案在弹出的这一刻求值，不然小睡/静音/钉住三项会停在第一次打开时的样子。"""
+        if self.quitting:
+            return
         self.menu.entryconfig(4, label="叫醒她" if self.life.sleeping else "让她小睡")
         self.menu.entryconfig(5, label="取消静音" if self.cfg.get("muted") else "别说话")
         self.menu.entryconfig(6, label="回到 Qoder 窗边" if self.pinned else "钉在当前位")
 
     def on_menu(self, event) -> None:
-        self.refresh_menu()
-        self.menu.tk_popup(event.x_root, event.y_root)
+        # "退出"的 command 在菜单事件里跑完 root.destroy()，Tcl 还会把排在后面的
+        # <Button-3> 投给已经没了的解译器——run/pet.err.log 里的 TclError 就是这么来的。
+        if self.quitting:
+            return
+        try:
+            self.refresh_menu()
+            self.menu.tk_popup(event.x_root, event.y_root)
+        except tk.TclError:
+            pass
 
     def toggle_sleep(self) -> None:
         self.life.sleeping = not self.life.sleeping
@@ -1350,8 +1376,8 @@ class Pet:
 
 def main() -> None:
     winutil.set_dpi_aware()
-    if not SHEET.exists():
-        raise SystemExit(f"缺少精灵表：{SHEET}")
+    if not (FRAMES_DIR / "idle").is_dir() or not sorted((FRAMES_DIR / "idle").glob("*.png")):
+        raise SystemExit(f"缺少素材：{FRAMES_DIR / 'idle'} 里没有帧，先跑 python build_motion.py")
     config = json.loads((APP / "config.json").read_text(encoding="utf-8"))
     local = APP / "config.local.json"
     if local.exists():

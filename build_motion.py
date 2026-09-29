@@ -1,24 +1,20 @@
 """Dense, layered animation frames for the standalone pet.
 
-The Qoder package is capped at 8 frames per row of 192x208, so this emits two
-things from one pass:
+Emits app/frames/<state>/*.png at S x the design cell, at full frame rate, and
+free of anything that only made sense inside a fixed sprite sheet. Secondary
+motion, breathing and blinking are applied on top of the authored choreography in
+qwen_poses. Playback timing comes from config.json so the pet and this script never
+disagree about how long a loop lasts.
 
-* app/frames/<state>/*.png at S x the sheet resolution, at full frame rate, and
-  without the ceiling charm - a free-floating window has no ceiling to hang it from,
-  and erasing it at load time used to cost a pixel flood-fill per frame.
-* out/spritesheet.webp, the Qoder package sheet, downsampled back to 192x208 cells
-  with the charm kept in-sheet.
-
-Secondary motion, breathing and blinking are applied on top of the base
-choreography in build_qwen_spritesheet. Playback timing comes from config.json so
-the pet and this script never disagree about how long a loop lasts.
+    python build_motion.py                  # 全部 12 个态
+    python build_motion.py shy idle         # 只重建这几个态
+    python build_motion.py --check          # 只量成品帧的安全框，一个字节都不写
 """
 
 from __future__ import annotations
 
 import json
 import math
-import shutil
 import sys
 from pathlib import Path
 
@@ -29,10 +25,10 @@ ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "app"))
 
-import build_qwen_spritesheet as base  # noqa: E402  (the pose/safe-area pipeline)
+import qwen_poses as base  # noqa: E402  (the pose/safe-area pipeline)
 import rigor  # noqa: E402
 
-# Rendering runs at a multiple of the sheet cell because the source poses are
+# Rendering runs at a multiple of the design cell because the source poses are
 # 1024x1024: squeezing them straight into 192x208 threw away 5x of linear detail,
 # and the pet then blew the result back up to ~269px for a 175%-DPI display.
 S = 2
@@ -56,16 +52,12 @@ NECK_FRACTION = 0.30  # rows above this stay rigid, so the hat never smears
 BLINK_WINDOW = 0.09
 
 CELL_W, CELL_H = base.FRAME_W * S, base.FRAME_H * S
-SHEET_W, SHEET_H = base.FRAME_W, base.FRAME_H
 SAFE_SIDE = base.SAFE_SIDE * S
 SAFE_TOP = base.SAFE_TOP * S
 BASELINE = base.BASELINE * S
 FOOT_MARGIN = base.FOOT_MARGIN * S
 PAD = base.PAD * S
 FOOT = 6 * S          # tilt pivot, measured up from the sprite's feet
-CHARM = 64 * S        # the emblem layer, in render pixels
-CHARM_X = 12 * S
-MASK_BOX = (44 * S, 76 * S)  # top-left corner: the charm, never her
 SPREAD_MIN = 12 * S   # smallest credible eye separation for face_lines
 GAP = 6 * S           # dark-pixel gap that counts as two separate clusters
 BLINK_LIP = 6 * S     # how far the blink band reaches above the eye line
@@ -77,8 +69,8 @@ MOTION = {
     for state, keys in base.MOTION.items()
 }
 
-# Standalone-only reactions. The Qoder sheet is a fixed nine-row contract, so these
-# never enter it: they exist as app/frames/<state>/ and as gestures in the running pet.
+# 三个反应专用态：只在被摸到/被甩出去的那一刻出场，各自一套编排与帧数。
+# 宠物端按目录发现它们，所以这几个态没出帧也不会崩，只会退回最近的烘焙态。
 EXTRA_MOTION = {
     "shy": [
         (0, 0, 0.0, 0.00), (-1, -1, -2.0, 0.01), (-2, -2, -3.0, 0.015), (-1, -1, -1.5, 0.005),
@@ -103,10 +95,8 @@ MOTION.update({
 })
 FRAMES.update(EXTRA_FRAMES)
 POSES = {**base.POSES, **{state: f"qwen-chibi-{state}" for state in EXTRA_MOTION}}
-CONTRACT = [state for state, _ in base.STATES]
 
 OUT_FRAMES = ROOT / "app" / "frames"
-OUT_SHEET = ROOT / "out" / "spritesheet.webp"
 CONFIG = ROOT / "app" / "config.json"
 
 # A run cycle needs more than one bounce: with a single pose the pet reads as a
@@ -240,23 +230,13 @@ def motion_at(state: str, index: int, count: int) -> tuple[float, float, float, 
     return tuple(keys[i0][k] + (keys[i1][k] - keys[i0][k]) * f for k in range(4))
 
 
-def charm_layer(state: str, dx: float) -> Image.Image:
-    return base.draw_charm(
-        swing=max(-20.0, min(20.0, -(dx * 4.5))),
-        droop=1.0 if state == "failed" else 0.0,
-        size=CHARM,
-    )
-
-
-def place(content: Image.Image, dx: float, dy: float, state: str, charm: bool) -> Image.Image:
+def place(content: Image.Image, dx: float, dy: float, state: str) -> Image.Image:
     frame = Image.new("RGBA", (CELL_W, CELL_H), (0, 0, 0, 0))
     cw, ch = content.size
     x = round((CELL_W - cw) / 2 + dx + FIT[state][1])
     y = round(CELL_H - BASELINE - ch + dy)
     x = max(SAFE_SIDE, min(CELL_W - cw - SAFE_SIDE, x))
     y = max(SAFE_TOP, min(CELL_H - ch - FOOT_MARGIN, y))
-    if charm:
-        frame.alpha_composite(charm_layer(state, dx), (CHARM_X, 0))
     frame.alpha_composite(content, (x, y))
     return frame
 
@@ -272,15 +252,14 @@ def render_state(state: str, count: int, sprites: list, height: int, cycle: floa
     springs = spring_series(state, count, cycle)
     return scaled, [
         animate(state, index, count, scaled[stride_frame(state, index)], springs, cycle,
-                charm=False, baked_life=baked_life)
+                baked_life=baked_life)
         for index in range(count)
     ]
 
 
 def art_box(frame: Image.Image) -> tuple[int, int, int, int]:
-    """Her bounding box alone; the ceiling charm may legitimately touch y = 0."""
+    """她的剪影占的那块框。过去这里要先抹掉左上角给挂饰留位子，现在成品帧不画挂饰。"""
     alpha = np.array(frame.getchannel("A"))
-    alpha[: MASK_BOX[0], : MASK_BOX[1]] = 0
     ys, xs = np.nonzero(alpha)
     if len(ys) == 0:
         return (0, 0, 0, 0)
@@ -323,7 +302,7 @@ def fit_state(state: str, count: int, sprites: list, cycle: float):
 
 def animate(
     state: str, index: int, count: int, sprite: Image.Image, springs: tuple,
-    cycle: float, charm: bool = True, baked_life: bool = True,
+    cycle: float, baked_life: bool = True,
 ) -> Image.Image:
     dx, dy, tilt, squash = motion_at(state, index, count)
     body = base.transform(sprite, dx, dy, tilt, squash, pad=PAD, foot=FOOT)
@@ -363,9 +342,9 @@ def animate(
         )
 
     phase = index / count
-    # Calm states get breathing and blinking from rigor.LifeLayer while she runs, off
-    # the frame clock, so the loop has no period to learn; the Qoder sheet has no such
-    # layer, so its cells keep them baked in.
+    # 安静态的呼吸与眨眼由运行时 rigor.LifeLayer 按墙钟算，不烘进帧里——预烘的循环再密
+    # 也有周期可被认出来。baked_life=True 只用在 fit_state 量安全框那一次：那是她轮廓
+    # 最大的时刻，按它来缩才不会真被切到。
     if baked_life and state in CALM:
         breath = 1.0 + 0.011 * math.sin(2 * math.pi * phase * 2)
         centre = top + height * 0.52
@@ -382,7 +361,7 @@ def animate(
                 content = rigor.band_scale(
                     content, lines["eye"] - BLINK_LIP, lines["eye"] + BLINK_CHIN, 0.55
                 )
-    return place(content, dx, dy, state, charm)
+    return place(content, dx, dy, state)
 
 
 def part_rig(sprite: Image.Image) -> dict:
@@ -397,11 +376,6 @@ def part_rig(sprite: Image.Image) -> dict:
         "skirt": {"pivot": (cx, top + h * 0.60), "r_in": h * 0.06, "r_out": h * 0.46,
                   "sector": SKIRT_SECTOR},
     }
-
-
-def sheet_cell(frame: Image.Image) -> Image.Image:
-    """Downsample one render-resolution frame back into the Qoder cell."""
-    return frame.resize((SHEET_W, SHEET_H), Image.Resampling.LANCZOS)
 
 
 def measure_shipped() -> int:
@@ -450,11 +424,9 @@ def main() -> None:
         raise SystemExit(f"没有这些状态：{sorted(unknown)}；可选：{sorted(FRAMES)}")
     rebuilt: list[str] = []
     bad: list[str] = []
-    OUT_SHEET.parent.mkdir(exist_ok=True)
-    sheet = Image.new("RGBA", (SHEET_W * base.COLS, SHEET_H * base.ROWS), (0, 0, 0, 0))
     rig_file = OUT_FRAMES / "rig.json"
     rig_map = json.loads(rig_file.read_text(encoding="utf-8")) if (only and rig_file.exists()) else {}
-    for row, state in enumerate(CONTRACT + list(EXTRA_MOTION)):
+    for state in FRAMES:
         if only and state not in only:
             continue
         count = FRAMES[state]
@@ -469,7 +441,7 @@ def main() -> None:
         mirrored = MIRROR_SOURCE.get(state)
         for index in range(count):
             frame = animate(state, index, count, scaled[stride_frame(state, index)], springs,
-                            cycle, charm=False, baked_life=False)
+                            cycle, baked_life=False)
             image = base.clear_hidden_rgb(frame)
             (image.transpose(Image.Transpose.FLIP_LEFT_RIGHT) if mirrored else image).save(
                 folder / f"{index:02d}.png")
@@ -482,30 +454,8 @@ def main() -> None:
                 "eye": None if lines["eye"] is None else lines["eye"] / CELL_H,
                 "chin": None if lines["chin"] is None else lines["chin"] / CELL_H,
             }
-        if state in CONTRACT:
-            keep = min(base.COLS, count)
-            picks = [round(k * (count - 1) / (keep - 1)) for k in range(keep)] if keep > 1 else [0]
-            for col, index in enumerate(picks):
-                # The sheet keeps its ceiling ornament and its baked breathing and blinks:
-                # a Qoder pet window has no life layer running under it.
-                sprite = scaled[stride_frame(state, index)]
-                if mirrored:
-                    # 挂饰钉在格子左上角、不参与镜像：先只出画片，翻完再把挂饰垫在她后面。
-                    # 摆幅要跟着身体反号——画片反了，挂饰却仍按向右甩的话，向左跑时
-                    # 她会看到挂饰朝运动的反方向荡。
-                    plain = animate(state, index, count, sprite, springs, cycle,
-                                    charm=False, baked_life=True)
-                    charming = Image.new("RGBA", (CELL_W, CELL_H), (0, 0, 0, 0))
-                    charming.alpha_composite(charm_layer(state, -motion_at(state, index, count)[0]),
-                                             (CHARM_X, 0))
-                    charming.alpha_composite(plain.transpose(Image.Transpose.FLIP_LEFT_RIGHT))
-                else:
-                    charming = animate(state, index, count, sprite, springs, cycle,
-                                       charm=True, baked_life=True)
-                sheet.alpha_composite(sheet_cell(charming), (col * SHEET_W, row * SHEET_H))
-        print(f"{state:14s} {count:2d} frames / {cycle:.2f}s = {count / cycle:4.1f}fps  art box={box}  "
-              f"{'OK' if fits(box) else 'VIOLATION'}"
-              f"{'' if state in CONTRACT else '  (独立宠物专用)'}")
+        print(f"{state:14s} {count:2d} frames / {cycle:.2f}s = {count / cycle:4.1f}fps  "
+              f"art box={box}  {'OK' if fits(box) else 'VIOLATION'}")
         rebuilt.append(state)
         if not fits(box):
             bad.append(state)
@@ -514,43 +464,45 @@ def main() -> None:
         eye = "-" if lines["eye"] is None else f"{lines['eye']:.3f}"
         chin = "-" if lines["chin"] is None else f"{lines['chin']:.3f}"
         print(f"  {state:14s} eye={eye} chin={chin}")
-    verify(rebuilt if only else None)   # 整表重建才顺带查精灵表的合同尺寸
+    verify(rebuilt)   # 写了哪些态就查哪些：部分重建过去直接跳过这一步
     if bad:
         raise SystemExit(f"这些状态的剪影越出安全框，帧已写盘但得复缩：{bad}")
     if only:
-        print("部分重建：精灵表未改动")
+        print("部分重建：预览图未改动")
         return
-    sheet.save(OUT_SHEET, lossless=True)
-    sheet.save(ROOT / "out" / "spritesheet.png")
-    base.preview(ROOT / "out" / "preview.png")
-    contact(ROOT / "out" / "contact.png")
-    # 运行侧读 app/assets/，最后一步不该靠手工拷贝
-    assets = ROOT / "app" / "assets"
-    assets.mkdir(parents=True, exist_ok=True)
-    shutil.copyfile(OUT_SHEET, assets / "spritesheet.webp")
-    print(f"sheet -> {OUT_SHEET} 与 {assets / 'spritesheet.webp'}")
+    contact(ROOT / "docs" / "preview.png")
+    print(f"preview -> {ROOT / 'docs' / 'preview.png'}")
 
 
-def contact(target: Path) -> None:
-    states = ["idle", "shy", "annoyed", "dizzy"]
-    tiles = []
-    for state in states:
-        files = sorted((OUT_FRAMES / state).glob("*.png"))
-        strip = Image.new("RGBA", (CELL_W * len(files), CELL_H), (250, 250, 252, 255))
-        for col, path in enumerate(files):
-            strip.alpha_composite(Image.open(path).convert("RGBA"), (col * CELL_W, 0))
-        tiles.append((state, strip))
-    canvas = Image.new("RGB", (max(t.width for _, t in tiles), sum(t.height for _, t in tiles)), (250, 250, 252))
+def contact(target: Path, columns: int = 8) -> None:
+    """README 用的那张：12 个态各一行，每行按列数均匀取样后缩回三分之二格。
+
+    全帧率的原图一张 384x416，232 张拼起来既没人看也没法进仓库；缩到 128x139 一格
+    刚好还能看清礼帽和扇面，整张 1.2MB 量级。
+    """
+    cell = (base.FRAME_W * 2 // 3, base.FRAME_H * 2 // 3)
+    rows = []
+    for state, count in FRAMES.items():
+        paths = sorted((OUT_FRAMES / state).glob("*.png"))
+        picks = [round(k * (len(paths) - 1) / (columns - 1)) for k in range(columns)] \
+            if len(paths) > 1 else [0]
+        strip = Image.new("RGBA", (cell[0] * columns, cell[1]), (250, 250, 252, 255))
+        for col, index in enumerate(picks):
+            frame = Image.open(paths[index]).convert("RGBA").resize(cell, Image.Resampling.LANCZOS)
+            strip.alpha_composite(frame, (col * cell[0], 0))
+        rows.append((state, strip))
+    canvas = Image.new("RGB", (cell[0] * columns, cell[1] * len(rows)), (250, 250, 252))
     y = 0
-    for _, strip in tiles:
+    for _state, strip in rows:
         canvas.paste(strip.convert("RGB"), (0, y))
         y += strip.height
-    canvas.save(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    canvas.save(target, optimize=True)
 
 
-def verify(states: list[str] | None = None) -> None:
+def verify(states: list[str]) -> None:
     """质检要跟着每一次重建跑，而且四边都查：单态重建过去直接跳过这一步。"""
-    checked = states or list(FRAMES)
+    checked = states
     clear = {"left": 999, "right": 999, "top": 999, "bottom": 999}
     violations: list[str] = []
     total = 0
@@ -576,13 +528,7 @@ def verify(states: list[str] | None = None) -> None:
             total += 1
     if violations:
         raise RuntimeError(f"{len(violations)} 帧越出安全框，最早几例：{violations[:5]}")
-    if states:
-        print(f"{total} frames checked ({','.join(states)})，tightest clearance {clear}")
-        return
-    sheet = Image.open(OUT_SHEET)
-    if sheet.size != (SHEET_W * 8, SHEET_H * 9):
-        raise RuntimeError(f"sheet is {sheet.size}, must stay {SHEET_W * 8}x{SHEET_H * 9}")
-    print(f"{total} frames at {CELL_W}x{CELL_H}, sheet {sheet.size}, tightest clearance {clear}")
+    print(f"{total} frames at {CELL_W}x{CELL_H}, tightest clearance {clear}")
 
 
 if __name__ == "__main__":

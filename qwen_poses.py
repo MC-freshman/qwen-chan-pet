@@ -1,46 +1,30 @@
-"""Build the Qoder desktop-pet spritesheet for the qwen-chan pet.
+"""The pose source and the shared geometry every qwen-chan frame is built on.
 
-Layout matches the Petdex/Codex v1 sheet the existing pets use:
-8 columns x 9 rows of 192x208 cells, one animation state per row.
+Not a spritesheet builder: `build_motion.py` is the only producer, and it emits
+per-state frame folders for the standalone pet. What lives here is the part that
+script needs and the pet itself never recomputes - where the AI poses are, how they
+get cut out and colour-matched, the authored keyframes, and the safe box a frame's
+silhouette must stay inside.
 """
 
 from __future__ import annotations
 
-import json
-import math
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "poses"
-OUT = ROOT / "out"
 
+# Cell the choreography is authored in. The pet renders at a multiple of this and
+# displays at a third scale, but every proportion below is cell pixels.
 FRAME_W = 192
 FRAME_H = 208
-COLS = 8
-ROWS = 9
 BASELINE = 12  # transparent pixels kept under the feet
-PAD = 32  # working border used while rotating/squashing
-# Qoder renders a 192x208 cell into a 128x176 window, and the fit mode is not
-# documented. Keeping every frame inside a centred 128x176 box makes contain,
-# cover, centre-crop and bottom-crop mappings all show her whole: a
-# bottom-anchored 1:1 crop of this cell only ever reveals y >= 32.
+PAD = 32       # working border used while rotating/squashing
 SAFE_TOP = 34
 SAFE_SIDE = 32
 FOOT_MARGIN = 4  # feet may sink into the baseline reserve, but not past this
-
-STATES = [
-    ("idle", 6),
-    ("running-right", 8),
-    ("running-left", 8),
-    ("waving", 4),
-    ("jumping", 5),
-    ("failed", 8),
-    ("waiting", 6),
-    ("running", 6),
-    ("review", 6),
-]
 
 POSES = {
     "idle": "qwen-chibi-idle",
@@ -54,7 +38,10 @@ POSES = {
     "review": "qwen-chibi-review",
 }
 
-# (dx, dy, tilt_deg, squash) per frame; squash>0 stretches vertically.
+# (dx, dy, tilt_deg, squash) per keyframe; squash>0 stretches vertically.
+# running-left is deliberately absent - it borrows running-right wholesale and the
+# finished frames get flipped, because negating a directional amplitude is not a
+# mirror (see MIRROR_SOURCE in build_motion.py).
 MOTION = {
     "idle": [
         (0, 0, 0.0, 0.00),
@@ -73,16 +60,6 @@ MOTION = {
         (2, -5, 4.0, 0.03),
         (0, -8, 4.5, 0.04),
         (-2, -5, 3.5, 0.02),
-    ],
-    "running-left": [
-        (4, 0, -3.0, -0.02),
-        (2, -5, -4.0, 0.03),
-        (0, -8, -4.5, 0.04),
-        (-2, -5, -4.0, 0.02),
-        (-4, 0, -3.0, -0.02),
-        (-2, -5, -4.0, 0.03),
-        (0, -8, -4.5, 0.04),
-        (2, -5, -3.5, 0.02),
     ],
     "waving": [
         (0, 0, -2.5, 0.00),
@@ -137,7 +114,6 @@ MOTION = {
 FIT = {
     "idle": (176, 0),
     "running-right": (168, 2),
-    "running-left": (168, -2),
     "waving": (172, 0),
     "jumping": (168, 0),
     "failed": (172, 0),
@@ -145,8 +121,6 @@ FIT = {
     "running": (164, 0),
     "review": (174, 0),
 }
-
-MIRROR = {"running-left"}
 
 
 def palette_anchors(image: Image.Image):
@@ -275,7 +249,7 @@ def transform(
 ) -> Image.Image:
     """Squash and rotate on a padded layer so the sprite canvas never cuts hair or fan.
 
-    pad/foot are cell pixels, so a caller rendering at 2x the sheet passes 2x of each.
+    pad/foot are cell pixels, so a caller rendering at 2x the cell passes 2x of each.
     """
     w, h = image.size
     src = image
@@ -296,161 +270,11 @@ def transform(
     return layer
 
 
-def draw_charm(swing: float, droop: float = 0.0, size: int = 64) -> Image.Image:
-    """Qwen six-petal emblem on a short chain, drawn oversized then downscaled."""
-    ss = 4
-    layer = Image.new("RGBA", (size * ss, size * ss), (0, 0, 0, 0))
-    d = ImageDraw.Draw(layer)
-    cx = size * ss // 2
-    chain_len = 20 + droop * 6
-    top = (cx, 0)
-    sway_x = math.sin(math.radians(swing)) * chain_len * 0.6
-    sway_y = math.cos(math.radians(swing)) * chain_len
-    px = cx + sway_x * ss
-    py = sway_y * ss
-    d.line([top[0], top[1], px, py], fill=(150, 160, 205, 200), width=2 * ss)
-    ring_r = 9.0 * ss
-    petal_r = 7.4 * ss
-    d.ellipse([px - ring_r, py - ring_r, px + ring_r, py + ring_r], fill=(43, 55, 110, 255))
-    for i in range(6):
-        a = math.radians(60 * i - 90 + swing * 0.4)
-        ex = px + math.cos(a) * petal_r * 0.52
-        ey = py + math.sin(a) * petal_r * 0.52
-        rr = petal_r * 0.46
-        d.ellipse([ex - rr, ey - rr, ex + rr, ey + rr], fill=(250, 251, 255, 255))
-    core = 1.9 * ss
-    d.ellipse([px - core, py - core, px + core, py + core], fill=(216, 178, 108, 255))
-    return layer.resize((size, size), Image.Resampling.LANCZOS)
-
-
-CLAMPED: list[str] = []
-
-
-def frame_content(
-    state: str, index: int, sprite: Image.Image
-) -> tuple[Image.Image, int, int, float]:
-    dx, dy, tilt, squash = MOTION[state][index]
-    body = transform(sprite, dx, dy, tilt, squash)
-    box = body.getchannel("A").getbbox()
-    return body.crop(box), dx, dy, tilt
-
-
-def fit_state(state: str, count: int, sprite: Image.Image) -> Image.Image:
-    """Shrink a state's sprite until its widest/tallest frame still fits the cell."""
-    height = FIT[state][0]
-    for _ in range(12):
-        scaled = fit(sprite, height)
-        need_h = need_w = 0
-        for index in range(count):
-            content, dx, dy, _tilt = frame_content(state, index, scaled)
-            cw, ch = content.size
-            need_h = max(need_h, ch - min(dy, 0))
-            need_w = max(need_w, cw + 2 * abs(dx + FIT[state][1]))
-        if need_h <= FRAME_H - BASELINE - SAFE_TOP and need_w <= FRAME_W - SAFE_SIDE * 2:
-            return scaled
-        height = int(height * 0.96)
-    return fit(sprite, height)
-
-
-def compose(state: str, index: int, sprite: Image.Image) -> Image.Image:
-    frame = Image.new("RGBA", (FRAME_W, FRAME_H), (0, 0, 0, 0))
-    content, dx, dy, tilt = frame_content(state, index, sprite)
-    cw, ch = content.size
-    x = (FRAME_W - cw) // 2 + dx + FIT[state][1]
-    y = FRAME_H - BASELINE - ch + dy
-    clamped_x = max(SAFE_SIDE, min(FRAME_W - cw - SAFE_SIDE, x))
-    clamped_y = max(SAFE_TOP, min(FRAME_H - ch - FOOT_MARGIN, y))
-    if (clamped_x, clamped_y) != (x, y):
-        CLAMPED.append(f"{state}/{index:02d}")
-    swing = max(-20.0, min(20.0, -(dx * 4.5 + tilt * 3.0)))
-    charm = draw_charm(swing=swing, droop=1.0 if state == "failed" else 0.0)
-    frame.alpha_composite(charm, (44 - 32, 0))
-    frame.alpha_composite(content, (clamped_x, clamped_y))
-    return frame
-
-
 def clear_hidden_rgb(image: Image.Image) -> Image.Image:
+    """Zero the RGB under fully transparent pixels: they never show, and leaving the
+    key colour there would make two identical frames hash differently."""
     import numpy as np
 
     arr = np.array(image)
     arr[arr[:, :, 3] == 0, :3] = 0
     return Image.fromarray(arr)
-
-
-def main() -> None:
-    OUT.mkdir(exist_ok=True)
-    sheet = Image.new("RGBA", (FRAME_W * COLS, FRAME_H * ROWS), (0, 0, 0, 0))
-    qa_root = OUT / "qa"
-    for row, (state, count) in enumerate(STATES):
-        sprite = trim(cutout(find_source(POSES[state])))
-        if state in MIRROR:
-            sprite = sprite.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
-        sprite = fit_state(state, count, sprite)
-        state_dir = qa_root / state
-        state_dir.mkdir(parents=True, exist_ok=True)
-        for old in state_dir.glob("*.png"):
-            old.unlink()
-        for index in range(count):
-            frame = clear_hidden_rgb(compose(state, index, sprite))
-            frame.save(state_dir / f"{index:02d}.png")
-            sheet.alpha_composite(frame, (index * FRAME_W, row * FRAME_H))
-        print(f"{state}: {count} frames")
-    sheet.save(OUT / "spritesheet.png")
-    sheet.save(OUT / "spritesheet.webp", lossless=True)
-    preview(OUT / "preview.png")
-    (OUT / "pet.json").write_text(
-        json.dumps(
-            {
-                "id": "qwen-chan",
-                "displayName": "qwen娘",
-                "description": "通义千问 Q 版桌宠：蓝发麻花辫、礼帽与六瓣徽记挂饰，持梅纹折扇，含待机/左右跑动/挥手/跳跃/沮丧/等待/小跑/审阅九组动作。",
-                "spritesheetPath": "spritesheet.webp",
-            },
-            ensure_ascii=False,
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    print(f"sheet {sheet.size} -> {OUT / 'spritesheet.webp'}")
-    print("注意：运行侧读的是 app/assets/spritesheet.webp，这一步不会搬过去；"
-          "要出成品帧与落位请跑 build_motion.py（它才是一致的那条路）")
-    verify()
-
-
-def verify() -> None:
-    clear = {"left": 99, "right": 99, "bottom": 99}
-    for state, count in STATES:
-        for index in range(count):
-            path = OUT / "qa" / state / f"{index:02d}.png"
-            box = Image.open(path).getchannel("A").getbbox()
-            if box is None:
-                raise RuntimeError(f"empty frame: {path}")
-            left, _top, right, bottom = box
-            clear["left"] = min(clear["left"], left)
-            clear["right"] = min(clear["right"], FRAME_W - right)
-            clear["bottom"] = min(clear["bottom"], FRAME_H - bottom)
-    print(f"tightest edge clearance: {clear}")
-    print(f"clamped frames: {CLAMPED or 'none'}")
-
-
-def preview(target: Path) -> None:
-    sheet = Image.open(OUT / "spritesheet.png").convert("RGBA")
-    pad = 26
-    canvas = Image.new("RGBA", (sheet.width + pad, sheet.height + pad * ROWS), (245, 246, 250, 255))
-    try:
-        font = ImageFont.truetype("arial.ttf", 15)
-    except OSError:
-        font = ImageFont.load_default()
-    draw = ImageDraw.Draw(canvas)
-    for row, (state, _) in enumerate(STATES):
-        y = pad * row + row * FRAME_H
-        draw.text((4, y + 4), f"{row} {state}", fill=(60, 60, 80, 255), font=font)
-        canvas.alpha_composite(
-            sheet.crop((0, row * FRAME_H, FRAME_W * COLS, (row + 1) * FRAME_H)), (pad, y)
-        )
-    canvas.save(target)
-
-
-if __name__ == "__main__":
-    main()

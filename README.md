@@ -1,41 +1,42 @@
 # qwen娘 桌宠
 
-Windows 桌面上跟着 Qoder 启停的养成系桌宠。**纯本地实现，token 消耗恒为 0**——数值、感知、台词全部来自本地状态机和一份手写台词池，不联网、不调模型。
+Windows 桌面上的一只养成系桌宠。**纯本地实现，token 消耗恒为 0**——数值、感知、台词全部来自本地状态机和一份手写台词池，不联网、不调模型。
 
-![九状态精灵表](docs/preview.png)
+![12 个状态各 8 帧](docs/preview.png)
 
-## 两种用法
-
-**当独立桌宠（推荐，功能完整）**
+## 怎么跑起来
 
 ```powershell
-pythonw app/sentinel.pyw          # 常驻哨兵：Qoder 开→拉起她，Qoder 关→她自退
-powershell -File app/install-startup.ps1   # 可选：注册开机自启
-powershell -File app/uninstall-startup.ps1 # 撤销自启并结束进程
+pythonw app/pet.pyw                   # 就她一只：手动起、手动关
+pythonw app/sentinel.pyw              # 常驻照看：她挂了拉起来（模式见 bind_qoder）
+powershell -File app/install-startup.ps1    # 可选：注册开机自启
+powershell -File app/uninstall-startup.ps1  # 撤销自启并结束进程
 ```
 
-**完全独立启动（当前配置）**
+出厂默认是**独立桌宠**：不依赖任何宿主程序，站桌面右下角，`config.local.json` 里
+`"requires_qoder": false`、`"follow_qoder": false`。
 
-```powershell
-pythonw E:\桌宠\qwen娘\app\pet.pyw
-```
-
-这条命令不经过 sentinel、不绑定 Qoder，也不会注册开机启动；位置固定在桌面右下角。
-开关保存在 `app/config.local.json` 的 `requires_qoder` / `follow_qoder`。
-
-**当 Qoder 内置桌宠**：把 `app/assets/spritesheet.webp` 和下面这个 `pet.json` 放进
-`~/.petdex/pets/qwen-chan/`，再到 Qoder 桌宠设置里刷新选择。
+想让她跟着 Qoder 启停（开发机上就是这么用的），在 `app/config.local.json` 里加：
 
 ```json
-{ "id": "qwen-chan", "displayName": "qwen娘", "spritesheetPath": "spritesheet.webp" }
+{ "requires_qoder": true, "bind_qoder": true }
 ```
+
+`requires_qoder` 管她**自己**（Qoder 消失超过宽限期就自退），`bind_qoder` 管**哨兵**
+（Qoder 在才拉起、关过一轮就把"别烦我"作废）。只设前者会出现"她走了但下次没人拉"，
+只设后者会出现"她自退了但哨兵又拉起来"，所以这两个要一起给。改完 `bind_qoder` 要重启哨兵，
+它只在启动时读一次。
 
 ## 生命周期怎么保证
 
-- 启动：哨兵每 3 秒查一次 `Qoder.exe` 主窗口是否存在，存在且她没跑就拉起（命名互斥体保证哨兵只有一个）
-- 退出：她自己内置看门狗，Qoder 消失超过宽限期就自毁——**崩溃和任务管理器强杀同样覆盖**
-- 存活检测走 Toolhelp32 进程快照。这台机器上 `OpenProcess` 拿到的句柄不可等待（`GetExitCodeProcess` 恒失败、`WaitForSingleObject` 对活进程返回"已退出"），所以不能靠句柄探测
+- 哨兵每 3 秒醒一次。命名互斥体保证同时只有一只哨兵
+- 她内置看门狗：绑定模式下 Qoder 消失超过宽限期就自毁——**崩溃和任务管理器强杀同样覆盖**
+- 存活检测走 Toolhelp32 进程快照。这台机器上 `OpenProcess` 拿到的句柄不可等待
+  （`GetExitCodeProcess` 恒失败、`WaitForSingleObject` 对活进程返回"已退出"），不能靠句柄探测
 - 坐标全部按 DPI-aware 取。175% 缩放下不声明 DPI 会拿到虚拟化的假坐标
+- 她**启动即崩**时哨兵按指数退避重拉（3→6→12…封顶 5 分钟），不会每 3 秒撞一次墙。
+  退避按"这一串连续失败"的起点计时，慢启动不会被误判成崩溃
+- 她出错时的堆栈进 `run/pet.err.log`（超 256KB 自动清空）。定格这种事没有日志就查不到
 
 ## 养成与"自我意识"
 
@@ -49,7 +50,7 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 | 好奇 | 掉得快，靠互动补 |
 
 `save.json` 里还存着她的自我画像：你最活跃的钟点、最近最常碰的文件名、累计陪伴天数，
-每天自动写一篇 `diary/` 日记（统计 + 模板拼装，非生成）。
+每天自动写一篇 `diary/` 日记（统计 + 模板拼装，非生成），周一凌晨结上周的账。
 
 **上限说清楚**：她的"知道"是前台窗口标题 + 空闲时长 + 统计查表，不是理解；台词是有限池子，几天后会开始重复。想升级只需把 `speech.py` 那层换成本地小模型，其余不用动。
 
@@ -59,30 +60,34 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 拽头发她会**恼**、拍身子应一声；点在她旁边的空气上不算摸她。
 
 单击摸头 · 双击喂食 · **按住 0.45 秒挠痒** · 拖拽钉住 · **甩出去她会掉在桌面上弹一下再站稳** ·
-滚轮改大小（她跟着抻一下）· 右键菜单（跳一下 / 把她放到桌面 / 小睡 / 别说话 / 回到 Qoder 窗边 / 看看数值 / 写日记 / 退出）
+滚轮改大小（她跟着抻一下）· 右键菜单（跳一下 / 把她放到桌面 / 小睡 / 别说话 / 钉在当前位 / 看看数值 / 写日记 / 退出）
 
 不用点她：她会**跟着你的光标转头**，你走开六秒后自己收回来；光标停在她身上两秒，
 她会说一句"你盯着我看做什么"。连点六下她会翻脸——第三下起收益就减半了。
 
-## 参数（`app/config.json`）
+## 参数（`app/config.json`，可被 `config.local.json` 覆盖）
 
+`bind_qoder` 哨兵是否绑 Qoder 启停 · `requires_qoder` 她是否随 Qoder 消失而自退 ·
 `follow_qoder` 是否吸附 Qoder 窗口右下角并跟随移动 · `perch_offset` 吸附偏移 ·
-`wander_range` 跑动范围 · `speech_min_gap_seconds` / `speech_max_per_hour` 说话节流 ·
-`quiet_hours` 静默时段 · `watchdog_grace_seconds` 退出宽限 · `long_work_minutes` 连续工作提醒阈值 ·
+`standalone_offset` 独立模式落位（默认贴右下角）· `scale` 大小 · `wander_range` 跑动范围 ·
+`speech_min_gap_seconds` / `speech_max_per_hour` 说话节流 · `quiet_hours` 静默时段 ·
+`watchdog_grace_seconds` 退出宽限 · `long_work_minutes` 连续工作提醒阈值 ·
+`idle_user_seconds` 你多久没动她才算"走开了" · `tts_enabled/tts_voice/tts_rate` 离线语音 ·
 `cycle_seconds` 每个状态**一跳多少秒**（播放时长属于动作本身，不属于帧数）
 
 ## 动效是怎么来的
 
-不是把几张图平移。`app/rigor.py` 只有两个原语，全部动画都由它们叠出来：
+不是把几张图平移。`app/rigor.py` 提供三个形变原语，全部动画由它们叠出来：
 
 - `shear_rows(image, offsets)` —— 按行水平位移（亚像素混合）
 - `band_scale(image, top, bottom, factor)` —— 按行纵向重采样某个横带
 - `polar_twist(image, pivot, amp, r_in, r_out, θ0, θ1)` —— 环形扇区绕枢轴旋转
-- `scale_about(image, factor, anchor_row)` —— 整幅以指定行为锚作纵向伸缩：落地挤压、滚轮抻长，脚不动
 
-再加第三个原语 `polar_twist`——把画面转极坐标后，让**环形扇区绕枢轴真旋转**（四边羽化），这是免遮罩的关节：不需要把图层切开就能让某个方向上的部件独立转。
+`polar_twist` 是免遮罩的关节：不需要把图层切开就能让某个方向上的部件独立转（四边羽化）。
+另有 `scale_about` 语义的 `squash_stretch`——整幅以指定行为锚作纵向伸缩并配平横向鼓胀，
+落地挤压和滚轮抻长时脚不动。
 
-在这三个原语上叠出五层运动：**基础编排**（位移/倾斜/挤压，`build_qwen_spritesheet.MOTION` 的关键帧按相位插值加密）+ **二级运动**（从运动自身速度取导数，让发梢、裙摆滞后于身体，髋部为支点）+ **关节弹簧**（`rigor.Spring` 跨整条循环预积分两遍再录制，头部反向稳住视线、裙摆滞后回弹；枢轴每帧从形变后的轮廓自动取，所以跟着倾斜走）+ **呼吸**（安静态胸腔纵向 ±1.1%）+ **眨眼**（每个循环里压扁眼带两帧）——安静态的这两项已经搬到下面的运行时生命层，出帧里只给 Qoder 包那份保留。
+在这三个原语上叠出五层运动：**基础编排**（位移/倾斜/挤压，`qwen_poses.MOTION` 的关键帧按相位插值加密）+ **二级运动**（从运动自身速度取导数，让发梢、裙摆滞后于身体，髋部为支点）+ **关节弹簧**（`rigor.Spring` 跨整条循环预积分三遍再录制，头部反向稳住视线、裙摆滞后回弹；枢轴每帧从形变后的轮廓自动取，所以跟着倾斜走）+ **呼吸**（安静态胸腔纵向 ±1.1%）+ **眨眼**（每个循环里压扁眼带两帧）。安静态的呼吸与眨眼由运行时生命层算，**不烘进帧里**。
 
 关节弹簧的可量化证据（部件位移 vs 身体位移）：
 
@@ -97,9 +102,9 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 
 运行时再加两层。**生命层**（`rigor.LifeLayer`）管安静态：待机/等待/审阅/沮丧这四态不再播帧序列，
 而是按墙钟连续算——三个互质周期的重心微摆、3.9 秒一次的呼吸、2.2–7.5 秒随机间隔的眨眼、
-6–24 秒一次带包络的主动转头。预烘帧再密也有周期，24 帧 4 秒的循环一分钟就能被认出来；
-这一层没有周期可找（实测：与 4 秒前那一帧的平均差 2.6 灰阶，从不趋零）。安静态的呼吸与眨眼
-因此从出帧里挪走了，Qoder 包那份没有运行时，仍然烘在格子里。
+6–24 秒一次带包络的主动转头，外加 4–8 分钟一次的东张西望和 6–10 分钟一次的伸懒腰。
+预烘帧再密也有周期，24 帧 4 秒的循环一分钟就能被认出来；这一层没有周期可找
+（实测：与 4 秒前那一帧的平均差 2.6 灰阶，从不趋零）。
 
 **视线跟随**：读光标相对她头部的水平偏移，量化成 7 档，用 `head_follow_profile` 只剪切头部——
 身体不动，头转向你。人离开 6 秒后自动停止跟随。枢轴来自 `rig.json`，存的是**占格子高度的比例**
@@ -107,8 +112,8 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 
 | | 数值 |
 | --- | --- |
-| 帧数 | 232 帧 / 12 状态（9 个契约状态 + 3 个反应专用态，每状态 16–24 帧） |
-| 出帧分辨率 | 384×416 渲染，Qoder 包降采样回 192×208 契约格 |
+| 帧数 | 232 帧 / 12 状态（9 个常用态 + 3 个反应专用态，每态 16–24 帧） |
+| 出帧分辨率 | 384×416（设计格 192×208 的 2 倍） |
 | 显示刷新 | **30fps**（`after(33)` + `timeBeginPeriod(1)`，实测 30.1fps；不开高精度定时器只能到 16.2） |
 | 形变速率 | 生命层按 20Hz 出图，30fps 的其余 tick 复用同一张画片——形变帧唯一且约 6ms，没必要每 tick 重算 |
 | 常驻开销 | 安静态 20Hz × 6.0ms ≈ 12% 单核；跑动/跳跃走预烘帧，几乎不耗 |
@@ -117,8 +122,8 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 `timeBeginPeriod(1)` 只把系统定时器粒度从 15.6ms 提到 1ms，不联网、不调模型、不额外起刷新循环；
 它会影响其它程序的 sleep 粒度，所以这是一个可关的开关，而不是默认行为。
 
-两个行映射原语各有两版：`shear_rows` / `band_scale` 是逐像素精确版，出帧时用；
-`shear_rows_fast` / `band_scale_fast` 是**分段仿射版**，运行时用——按剖面的拐点切段，
+两个行映射原语各有两版：`shear_rows` / `band_scale` 是逐像素精确版，**出帧时**用；
+`shear_rows_fast` / `band_scale_fast` 是**分段仿射版**，**运行时**用——按剖面的拐点切段，
 每段交给 Pillow 在 C 里做一次仿射重采样。269×291 的格子上，三原语一帧从 22.9ms 降到
 6.2ms（占单核约 10%），拐点没切准就会在头发上留下一行接缝，所以 `_band_edges` 里
 "拐点 + 至少 3 行一段"这两条是硬要求，不是优化口味。
@@ -136,28 +141,27 @@ pythonw E:\桌宠\qwen娘\app\pet.pyw
 跑步原来只有一张图在上下弹，再高的帧率也变不出迈步。现在 `running-right / running-left / running`
 用两张步幅帧（`qwen-chibi-run-a/b`：右脚在前 / 左脚在后经过）每 4 帧交替，配合身体起伏。
 
+`running-left` 不是"把带方向的量取反"凑出来的：形参整套沿用 `running-right`，最后把**成品帧整幅翻**。
+原因是 `polar_twist` 的扇形羽化只在起始边斜坡，实测振幅取反后仍有 1.6% 的像素不互为镜像。
+
 ## 素材管线
 
 ```
-poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠物，384×416、全帧率、不含挂饰）
-                                  →  out/spritesheet.webp      （Qoder 包，192×208 契约格、每行 8 帧、保留挂饰）
+poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png + app/frames/rig.json
 ```
 
-`build_motion.py` 复用 `build_qwen_spritesheet.py` 的去背、安全区与姿态编排，两者共用同一份素材源。
-精灵表 `1536×1872`：8 列 × 9 行，每格 `192×208`，行序
-`idle / running-right / running-left / waving / jumping / failed / waiting / running / review`。
+`build_motion.py` 复用 `qwen_poses.py` 的去背、色彩拉齐、安全区与姿态编排。改源图后重跑
+`python build_motion.py` 就同步全部成品帧；`python build_motion.py shy idle` 只重建这几个态
+（顺带保留 `rig.json` 里其余条目）；`python build_motion.py --check` 只量安全框、一个字节都不写。
 
 当前 idle 源图是 `poses/qwen-chibi-idle_20260927_v2.png`：双手自然下垂、扇子放在身侧，
-避免旧版待机一直举手造成的招手感。改源图后重新运行 `python build_motion.py` 即可同步独立帧和精灵表。
-
-三个**反应专用态** `shy / annoyed / dizzy` 只出 `app/frames/`，不进精灵表——九行是 Qoder 包的硬契约。
-运行时按目录发现它们（`extra_states`），缺帧就退回最近的烘焙态，所以 Qoder 那份不会崩。
-`python build_motion.py shy annoyed dizzy` 只重建这几个状态（顺带保留 `rig.json` 里其余条目）。
+避免旧版待机一直举手造成的招手感（`find_source` 按文件名排序取最后一个）。
 
 两个坑写死在脚本里：
 
-- **安全区**：Qoder 桌宠窗是 `128×176` 而格子是 `192×208`，映射方式未知，所以素材统一收进
-  居中的 `128×176` 盒并让顶部留白压过 `y=32`——contain / cover / 居中裁 / 底部对齐裁四种映射都不会削头
+- **安全框**：每格四周留 `SAFE_SIDE/SAFE_TOP/FOOT_MARGIN` 的余量，且缩放的判据是**形变之后**
+  的成品剪影而不是入参图——过去只看入参图，于是摆头、关节旋转和眨眼能把人推出格子边，
+  跳跃时举起的扇子就是这么被削掉的
 - **键色窗口**：`-transparentcolor` 不能混合半透明像素，素材必须先放大再把 alpha 硬阈值到 0/255，
   剪切之后还要再硬阈值一次，否则轮廓外会有一圈键色描边
 
@@ -171,11 +175,27 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png   （独立宠�
 
 形象基于通义千问非官方吉祥物二创，最先由B站up主生成，仅供个人学习与本地使用；原始参考立绘未纳入本仓库。
 
-## 2026-09-26 改进批次（P 表 Q0-Q5）
+## 改动批次与验收闸门
 
-- **状态过渡**（Q1）：进入任何状态不再硬切——0.40s 的"落座"包络（旧姿态单侧淡出 + 正弦形变暗示），12 态全部覆盖，最坏过渡步 ≤ 硬切的 65%（`tools/probe_transition.py`）。精灵图路线的结构底线：transparentcolor 键控要求 alpha 二值化，逐像素双向交叉淡变不可用（详见 LEDGER）。
-- **信号源**（Q3）：接入 `E:\桌宠\signals\` 目录协议。agent 跑任务（qoder.busy）、跑完（qoder.done）、前台白名单（boss）都会让她开口；新增台词 18 句。
-- **防重复**（Q2）：台词 157 → **273** 句；历史窗 12→40；环境类子键 4h 分类级冷却；反应态（shy/annoyed/dizzy）台词改走独立通道。7 天模拟 48h 窗口重复率 0%（selftest H 项）。
-- **语音**（Q4）：SAPI5 离线 TTS（Huihui），与 grok娘 同款模块；`tts_enabled/tts_voice/tts_rate` 配置。**2026-09-27 起 `tts_enabled` 默认关**（用户要求静音；气泡文字照常，要出声把它改回 true）。
-- **自检闸门**（Q0）：`python app/selftest.py`——8+1 项无头检查（占位符/触发面/去重/衰减/离线上限/存档/日记/48h 重复率），改台词或数值后先跑它。
-- **Qoder hook**：与 grok娘 共用 `desktop-pet-signals@local` 插件（信号目录 E:\桌宠\signals），Qoder 重启后生效。
+批次台账在 `docs/LEDGER.md`（P 表 Q0-Q5 的 DQ 项、逐行审计的 DA 项、独立化轮次 DB 项、本轮清理的 DC 项）。
+改完任何东西跑这三道，全绿才算完：
+
+```powershell
+python app/selftest.py       # 9 项无头闸门：占位符/触发面/去重/衰减/离线上限/存档/日记/48h 重复率
+python tools/probe_audit.py  # 41 项判据：审计轮每个缺陷的复现与修复，含两种生命周期模式
+python build_motion.py --check   # 232 帧对着安全框读一遍
+python tools/live_check.py   # 真实跑 20 秒：她在动、报错日志零新增
+```
+
+几条已经落地的事实，记在这里免得被当成待办：
+
+- **状态过渡**（Q1）：进入任何状态不硬切——0.40s 的"落座"包络（旧姿态单侧淡出 + 正弦形变暗示），
+  12 态全覆盖，最坏过渡步 ≤ 硬切的 65%（`tools/probe_transition.py`）。键控窗口要求 alpha 二值化，
+  逐像素双向交叉淡变不可用，所以淡变只能做单侧。
+- **信号源**（Q3）：读 `E:\桌宠\signals\` 目录协议。agent 跑任务（`qoder.busy`）、跑完
+  （`qoder.done`）、前台白名单（`boss`）都会让她开口。这个目录过去算错一层，她一个信号都没读到
+  （DA-6），现在端到端通。与 grok娘 共用同一个目录，谁先读到谁说。
+- **防重复**（Q2）：台词 157 → **273** 句；历史窗 12→40；环境类子键 4h 分类级冷却；反应态
+  （shy/annoyed/dizzy）台词走独立通道不受 240s 频控。7 天模拟 48h 窗口重复率 0%（selftest H 项）。
+- **语音**（Q4）：SAPI5 离线 TTS（Huihui），与 grok娘 同款模块。**当前默认关**（`tts_enabled: false`，
+  用户要求静音；气泡文字照常，要出声改回 true）。

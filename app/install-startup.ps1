@@ -13,7 +13,7 @@ $shortcut = $shell.CreateShortcut($link)
 $shortcut.TargetPath = $pythonw
 $shortcut.Arguments = '"' + $sentinel + '"'
 $shortcut.WorkingDirectory = $root
-$shortcut.Description = "qwen-chan pet sentinel (follows Qoder)"
+$shortcut.Description = "qwen-chan pet supervisor (mode: config bind_qoder)"
 $shortcut.Save()
 
 Write-Host "startup shortcut: $link"

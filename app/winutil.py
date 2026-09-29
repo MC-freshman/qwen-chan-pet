@@ -179,6 +179,38 @@ def window_pid(hwnd: int) -> int:
 SHELL_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "TopLevelWindowForOverflowXamlIsland"}
 
 
+class _MonitorInfo(C.Structure):
+    _fields_ = [
+        ("cbSize", W.DWORD),
+        ("rcMonitor", W.RECT),
+        ("rcWork", W.RECT),
+        ("dwFlags", W.DWORD),
+    ]
+
+
+MONITOR_DEFAULTTONEAREST = 0x00000002
+
+
+def monitor_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    """窗口所在显示器整块区域 (left, top, width, height)。
+
+    GetSystemMetrics(0/1) 只给主屏：游戏放在副屏时"铺满副屏"永远凑不到主屏的尺寸，
+    她就该让路却没有让。全屏的参照物是它自己那块屏。
+    """
+    user32.MonitorFromWindow.restype = C.c_void_p
+    user32.MonitorFromWindow.argtypes = [W.HWND, W.DWORD]
+    monitor = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    if not monitor:
+        return None
+    info = _MonitorInfo()
+    info.cbSize = C.sizeof(_MonitorInfo)
+    user32.GetMonitorInfoW.argtypes = [C.c_void_p, C.POINTER(_MonitorInfo)]
+    if not user32.GetMonitorInfoW(monitor, C.byref(info)):
+        return None
+    r = info.rcMonitor
+    return r.left, r.top, r.right - r.left, r.bottom - r.top
+
+
 def window_is_borderless_fullscreen(hwnd: int) -> bool:
     """A caption-less window covering (almost) the whole screen: a game, not an editor."""
     if not hwnd or not user32.IsWindowVisible(hwnd):
@@ -190,10 +222,12 @@ def window_is_borderless_fullscreen(hwnd: int) -> bool:
     style = user32.GetWindowLongW(hwnd, GWL_STYLE) & 0xFFFFFFFF
     if style & WS_CAPTION:
         return False
+    area = monitor_rect(hwnd) or (0, 0, user32.GetSystemMetrics(0), user32.GetSystemMetrics(1))
+    if area[2] <= 0 or area[3] <= 0:
+        return False
     rect = W.RECT()
     user32.GetWindowRect(hwnd, C.byref(rect))
-    width, height = user32.GetSystemMetrics(0), user32.GetSystemMetrics(1)
-    return (rect.right - rect.left) >= width * 0.98 and (rect.bottom - rect.top) >= height * 0.98
+    return (rect.right - rect.left) >= area[2] * 0.98 and (rect.bottom - rect.top) >= area[3] * 0.98
 
 
 def fullscreen_foreground(exclude_pid: int, exclude_hwnd: int = 0) -> bool:
@@ -210,9 +244,6 @@ def fullscreen_foreground(exclude_pid: int, exclude_hwnd: int = 0) -> bool:
 
 def foreground_title() -> str:
     return _window_text(user32.GetForegroundWindow())
-
-
-_IDLE_INFO_CLASS = 3
 
 
 class _LastInputInfo(C.Structure):

@@ -293,8 +293,14 @@ class LifeLayer:
             + 0.11 * math.sin(t * 1.73 + 1.1)
         ) * 2.4 * unit
         profile = simple_pendulum(height, height * 0.66, sway, rigid_above=height * 0.30)
-        glance = self._glance_turn(now, unit)
-        turn = self._turn(now, unit) if glance == 0.0 else 0.0
+        # 头部动作要拿 chin_row 当支点：rig.json 里没有这个态的地标时（None）整段跳过。
+        # _turn 自己查过，_glance_turn 查不到就会把 None 递给 head_follow_profile，
+        # 实测 t+0.15s 抛 TypeError——而调用方 loop() 只把 traceback 写进日志，
+        # 表现是她定格在某一帧而不是崩掉。
+        glance = turn = 0.0
+        if self.chin_row is not None:
+            glance = self._glance_turn(now, unit)
+            turn = self._turn(now, unit) if glance == 0.0 else 0.0
         if glance:
             profile = profile + head_follow_profile(
                 height, self.chin_row, glance, shoulder=26.0 * unit
@@ -383,40 +389,3 @@ class Spring:
         self.x += self.v * dt
         return self.x
 
-
-def drop_detached(image: Image.Image, limit_row: int, limit_col: int) -> Image.Image:
-    """Erase alpha blobs that sit entirely inside the top-left corner.
-
-    The sheet's charm hangs from the cell ceiling, which a free-floating window has
-    no use for, but it swings and droops by state, so a fixed box either leaves a
-    sliver behind or eats into the hat. Detachment is the reliable signal: anything
-    connected to her body survives, an isolated corner ornament goes.
-    """
-    from collections import deque
-
-    arr = np.array(image.convert("RGBA"))
-    alpha = arr[:, :, 3] > 0
-    seen = np.zeros(alpha.shape, dtype=bool)
-    height, width = alpha.shape
-    removed = 0
-    for sy in range(min(limit_row, height)):
-        for sx in range(min(limit_col, width)):
-            if not alpha[sy, sx] or seen[sy, sx]:
-                continue
-            queue = deque([(sy, sx)])
-            seen[sy, sx] = True
-            blob = [(sy, sx)]
-            while queue:
-                y, x = queue.popleft()
-                for ny, nx in ((y + 1, x), (y - 1, x), (y, x + 1), (y, x - 1)):
-                    if 0 <= ny < height and 0 <= nx < width and alpha[ny, nx] and not seen[ny, nx]:
-                        seen[ny, nx] = True
-                        queue.append((ny, nx))
-                        blob.append((ny, nx))
-            if max(b[0] for b in blob) < limit_row and max(b[1] for b in blob) < limit_col:
-                for y, x in blob:
-                    alpha[y, x] = False
-                removed += len(blob)
-    arr[:, :, 3] = np.where(alpha, 255, 0).astype(np.uint8)
-    arr[arr[:, :, 3] == 0, :3] = 0
-    return Image.fromarray(arr, "RGBA")

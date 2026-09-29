@@ -39,24 +39,34 @@ class TTS:
         try:
             import pyttsx3
             engine = pyttsx3.init()
-            vid = ""
-            for v in engine.getProperty("voices"):
-                tag = (v.id + " " + v.name + " " + " ".join(
-                    [str(x) for x in (getattr(v, "languages", []) or [])])).lower()
-                if self.voice and self.voice in (v.id + v.name):
-                    vid = v.id
-                    break
-                if not vid and ("zh" in tag or "huihui" in tag):
-                    vid = v.id
-            if self.voice and not vid:
-                vid = self.voice
-            if vid:
-                engine.setProperty("voice", vid)
-            if self.rate:
-                engine.setProperty("rate", int(self.rate))
         except Exception as e:
             self.last_error = f"engine init: {e}"
             engine = None
+        if engine is not None:
+            # 音色和语速单独兜错：config 里 tts_voice 拼错只该退回 SAPI 的默认音色。
+            # 旧写法和引擎初始化共用一个 try，一次 setProperty 抛错就把 engine 置成
+            # None——她从此永久静音，而 last_error 里只留一句 "engine init"。
+            try:
+                vid = ""
+                for v in engine.getProperty("voices"):
+                    tag = (v.id + " " + v.name + " " + " ".join(
+                        [str(x) for x in (getattr(v, "languages", []) or [])])).lower()
+                    if self.voice and self.voice in (v.id + v.name):
+                        vid = v.id
+                        break
+                    if not vid and ("zh" in tag or "huihui" in tag):
+                        vid = v.id
+                if self.voice and not vid:
+                    vid = self.voice
+                if vid:
+                    engine.setProperty("voice", vid)
+            except Exception as e:
+                self.last_error = f"voice select: {e}"
+            if self.rate:
+                try:
+                    engine.setProperty("rate", int(self.rate))
+                except Exception as e:
+                    self.last_error = f"rate set: {e}"
         while True:
             text = self._jobs.get()
             if not text or engine is None:
