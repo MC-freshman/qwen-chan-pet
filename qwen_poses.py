@@ -211,9 +211,16 @@ def find_source(name: str) -> Path:
     return hits[-1]
 
 
-def cutout(path: Path, thresh: int = 16) -> Image.Image:
-    """Drop the flat white studio background, keeping enclosed whites."""
+def cutout(path: Path, thresh: int = 16, min_area: int = 2000) -> Image.Image:
+    """Drop the flat white studio background, keeping enclosed whites.
+
+    R2 补丁：AI 出图会在背景上撒彩色噪点（孤立小连通域，grok娘 管线的
+    drop_confetti 专治这个）。flood fill 只认与边角相连的近白区，彩噪既不白
+    也不连边，会整个活下来、烙进每一帧，在深色桌面上就是一层雪花。
+    按连通域面积剔除：主体是十万像素级，噪点是个位数像素级，2000 很安全。
+    """
     import numpy as np
+    from scipy import ndimage
 
     rgb = Image.open(path).convert("RGB")
     filled = rgb.copy()
@@ -223,7 +230,14 @@ def cutout(path: Path, thresh: int = 16) -> Image.Image:
         ImageDraw.floodfill(filled, corner, marker, thresh=thresh)
     inside = np.any(np.array(filled) != np.array(marker), axis=2)
     arr = np.array(rgb)
-    out = np.dstack([arr, (inside * 255).astype(np.uint8)])
+    alpha = (inside * 255).astype(np.uint8)
+    solid = alpha >= 128
+    lab, n = ndimage.label(solid)
+    if n:
+        sizes = ndimage.sum(solid, lab, range(1, n + 1))
+        drop = np.isin(lab, np.nonzero(sizes < min_area)[0] + 1)
+        alpha[drop] = 0
+    out = np.dstack([arr, alpha])
     return Image.fromarray(out, "RGBA")
 
 

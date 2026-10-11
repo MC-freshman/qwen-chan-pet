@@ -34,7 +34,7 @@ VARS = {"file", "seen", "hour", "days", "minutes", "app", "energy", "mood",
 TRIGGERED = {
     "greet": {"morning", "afternoon", "evening", "late_night", "back_short", "back_long", "first_meet"},
     "state": {"idle", "running", "waving", "jumping", "failed", "waiting", "review",
-              "shy", "annoyed", "dizzy"},
+              "shy", "annoyed", "dizzy", "surprised", "sleepy"},
     "touch": {"pet", "hat", "face", "hair", "skirt", "body", "feed", "drag", "thrown",
               "landed", "tickle", "annoyed", "reject", "watched"},
     "needs": {"low_energy", "low_mood", "low_affection", "high_affection"},

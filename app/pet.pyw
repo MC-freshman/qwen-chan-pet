@@ -34,7 +34,7 @@ DISPLAY_BASE = (192, 208)
 MIRROR_PAIR = {"running-right": "running-left", "running-left": "running-right"}
 # States quiet enough to carry the runtime life layer; the moving ones already have
 # their own choreography baked in.
-CALM_STATES = {"idle", "waiting", "review", "failed"}
+CALM_STATES = {"idle", "waiting", "review", "failed", "sleepy"}
 # Where each touched body part sends her: the first name is a standalone-only reaction
 # pose that exists only when its frames are on disk, the second is the baked fallback.
 ZONE_STATE = {
@@ -706,7 +706,7 @@ class Pet:
         if self.x < self.anchor - limit:
             return "running-right"
         if self.life.sleeping:
-            return "waiting"
+            return "sleepy" if "sleepy" in self.extra_states else "waiting"
         energy, mood = self.life.needs["energy"], self.life.needs["mood"]
         idle_user = winutil.idle_seconds() > self.cfg["idle_user_seconds"]
         if idle_user:
@@ -841,6 +841,8 @@ class Pet:
                 except OSError:
                     pass
                 continue
+            if self.cfg.get("muted"):
+                continue   # Keep an unspoken event until unmuted or TTL expiry.
             text = self.speech.pick(cat, **self.line_vars())
             if text:
                 self.signal_cool[cat] = now
@@ -850,7 +852,7 @@ class Pet:
                     pass
                 self.say(text)
         kws = self.cfg.get("boss_window_keywords") or []
-        if kws and now - self.boss_cool > self.cfg.get("boss_cooldown_minutes", 30) * 60:
+        if not self.cfg.get("muted") and kws and now - self.boss_cool > self.cfg.get("boss_cooldown_minutes", 30) * 60:
             title = (winutil.foreground_title() or "").lower()
             if title and any(k.lower() in title for k in kws):
                 text = self.speech.pick("boss", **self.line_vars())
@@ -1141,7 +1143,7 @@ class Pet:
         self.life.stats["drags"] += 1
         self.life.bump("mood", -1.0)
         self.life.bump("curiosity", 2.0)
-        self.react("dizzy", "waiting", 1.2)
+        self.react("surprised", "dizzy", 1.2)
         self.say(self.speech.pick("touch", "thrown", **self.line_vars()))
 
     def physics(self, dt: float) -> None:
@@ -1273,8 +1275,8 @@ class Pet:
         # 独立模式下 run/quit 由哨兵在自己启动时清掉，所以有效期是"本次开机"而不是
         # "本次 Qoder 会话"——文案要说清是哪一种，不然他以为点一次就永久安静了。
         menu.add_command(
-            label="退出（本次 Qoder 期间不再自动回来）" if self.cfg.get("bind_qoder")
-            else "退出（本次开机期间不再自动回来）",
+            label="退出（Qoder 关闭或重启前不自动回来）" if self.cfg.get("bind_qoder")
+            else "退出（重启守护或电脑前不自动回来）",
             command=self.quit)
         return menu
 
@@ -1299,7 +1301,8 @@ class Pet:
 
     def toggle_sleep(self) -> None:
         self.life.sleeping = not self.life.sleeping
-        self.force("waving" if not self.life.sleeping else "waiting", 1.6)
+        self.force("waving" if not self.life.sleeping
+                   else ("sleepy" if "sleepy" in self.extra_states else "waiting"), 1.6)
 
     def toggle_mute(self) -> None:
         self.cfg["muted"] = not self.cfg.get("muted", False)

@@ -2,7 +2,7 @@
 
 Windows 桌面上的一只养成系桌宠。**纯本地实现，token 消耗恒为 0**——数值、感知、台词全部来自本地状态机和一份手写台词池，不联网、不调模型。
 
-![12 个状态各 8 帧](docs/preview.png)
+![14 个状态各 8 帧](docs/preview.png)
 
 ## 怎么跑起来
 
@@ -37,6 +37,8 @@ powershell -File app/uninstall-startup.ps1  # 撤销自启并结束进程
 - 她**启动即崩**时哨兵按指数退避重拉（3→6→12…封顶 5 分钟），不会每 3 秒撞一次墙。
   退避按"这一串连续失败"的起点计时，慢启动不会被误判成崩溃
 - 她出错时的堆栈进 `run/pet.err.log`（超 256KB 自动清空）。定格这种事没有日志就查不到
+- 双击 exe 启动的堆栈进 `app/run/pet.exe.log`，记录解释器、子进程 PID 与启动异常；启动时超过 256KB 轮转为 `.1`。
+- 主动退出：绑定模式抑制到 Qoder 关闭或重启，独立模式抑制到守护重启。退出标记没有默认 TTL，避免主动退出后自行回来。
 
 ## 养成与"自我意识"
 
@@ -178,24 +180,26 @@ poses/*.png  →  build_motion.py  →  app/frames/<state>/*.png + app/frames/ri
 ## 改动批次与验收闸门
 
 批次台账在 `docs/LEDGER.md`（P 表 Q0-Q5 的 DQ 项、逐行审计的 DA 项、独立化轮次 DB 项、本轮清理的 DC 项）。
-改完任何东西跑这三道，全绿才算完：
+当前 14 态、272 帧、332 句。改动后按影响范围运行闸门；最新自动验收见 `docs/validation-20261011/report.json`。
 
 ```powershell
 python app/selftest.py       # 9 项无头闸门：占位符/触发面/去重/衰减/离线上限/存档/日记/48h 重复率
 python tools/probe_audit.py  # 41 项判据：审计轮每个缺陷的复现与修复，含两种生命周期模式
-python build_motion.py --check   # 232 帧对着安全框读一遍
-python tools/live_check.py   # 真实跑 20 秒：她在动、报错日志零新增
+python build_motion.py --check   # 272 帧，安全框与噪点检查
+python tools/probe_behavior.py  # 隔离存档与信号：14 态渲染、气泡、冷却、TTL、静音
+python tools/probe_launcher.py  # 真实子进程异常、启动失败、日志轮转
+python tools/test_exe.py     # exe 冷启动、动画、存活、单实例；暂时停止本项目进程并恢复本地配置
 ```
 
 几条已经落地的事实，记在这里免得被当成待办：
 
 - **状态过渡**（Q1）：进入任何状态不硬切——0.40s 的"落座"包络（旧姿态单侧淡出 + 正弦形变暗示），
-  12 态全覆盖，最坏过渡步 ≤ 硬切的 65%（`tools/probe_transition.py`）。键控窗口要求 alpha 二值化，
+  原 12 态及新增反应态共用过渡机制，最坏过渡步 ≤ 硬切的 65%（`tools/probe_transition.py`）。键控窗口要求 alpha 二值化，
   逐像素双向交叉淡变不可用，所以淡变只能做单侧。
 - **信号源**（Q3）：读 `E:\桌宠\signals\` 目录协议。agent 跑任务（`qoder.busy`）、跑完
   （`qoder.done`）、前台白名单（`boss`）都会让她开口。这个目录过去算错一层，她一个信号都没读到
   （DA-6），现在端到端通。与 grok娘 共用同一个目录，谁先读到谁说。
-- **防重复**（Q2）：台词 157 → **273** 句；历史窗 12→40；环境类子键 4h 分类级冷却；反应态
+- **防重复**（Q2/R2）：台词 157 → **332** 句；历史窗 12→40；环境类子键 4h 分类级冷却；反应态
   （shy/annoyed/dizzy）台词走独立通道不受 240s 频控。7 天模拟 48h 窗口重复率 0%（selftest H 项）。
 - **语音**（Q4）：SAPI5 离线 TTS（Huihui），与 grok娘 同款模块。**当前默认关**（`tts_enabled: false`，
   用户要求静音；气泡文字照常，要出声改回 true）。

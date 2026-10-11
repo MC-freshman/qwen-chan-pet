@@ -74,3 +74,26 @@ grok娘 一行未动（本轮范围只到 qwen）。她目前的状态：`shell/
 | DC-11 | README 通篇把"跟着 Qoder 启退"当默认、`build_qwen_spritesheet` 与"两个原语"数不对、素材管线画着两条输出 | 重写：默认独立 + `bind_qoder` 可选（并写清 `requires_qoder` 与 `bind_qoder` 各管谁、为什么必须一起给）、原语三条、管线一条输出、验收四道闸门列出来。版权段沿用你远程改定的措辞，一字未动 |
 
 **没删的三样，理由写在这**：① `shear_rows`/`band_scale`/`polar_twist`/`Spring` 这些"慢版本"运行时确实不用，但出帧管线 `build_motion` 就是它们唯一的用户，删了等于改素材质量降级；② `cfg["standalone_offset"]` 在两份配置里都没写、永远走默认值，但它是个给人留的旋钮，读法带默认不会炸；③ `ZONE_STATE` 里 `hair → failed` 这条不可达（摸头发只会出 `annoyed`），那是编排选择不是缺陷，改它等于改她的脾气，等你发话。
+
+## R2 轮（10-09 立绘 / 台词 / 打包）
+
+方案：`E:\桌宠\docs\桌宠更新-阶段1-3-P表.md`（A1/P1 阶段）。判据：`build_motion.py --check` 272 帧全合格 + `probe_audit.py` 41 项 + `selftest.py` 9 项（332 句）+ `tools/probe_r2_states.py` 9 项。
+
+| 编号 | 现象 | 复现 | 影响面 | 定位 | 处置 |
+|---|---|---|---|---|---|
+| DR-1 | 原方案"3 张新表情图"前提不成立：她的表情=态，运行时按 `app/frames/` 目录发现态，单张图不成态 | 勘察 pet.pyw:254 / build_motion.py:74-97 | 方案级 | — | **方案修正（P表 V1/V2）**：改为新增 2 个独立反应态 surprised / sleepy，走 shy/annoyed/dizzy 同款三件套（pose＋编排＋触发） |
+| DR-2 | ImageGen 三连并行调用相互覆盖，三个调用写进同一个输出文件，只活下来一张 | `_update_workspace` 只剩 1 张 | 出图成本 | 工具 output path 竞态 | **改串行出图**，补出 2 张；浪费约 1-2 张 credits，登记在案。教训：ImageGen 不并行 |
+| DR-3 | 新反应态 surprised（被甩出去那一瞬）与 sleepy（睡眠/小睡）落地 | — | 素材+接线 | build_motion `EXTRA_MOTION/FIT/FRAMES` + config `cycle_seconds` + pet.pyw 接线 | **已落地**：`throw()` → `react("surprised","dizzy")`；`pick_state` 睡眠分支与 `toggle_sleep` → `sleepy`（fallback `waiting`）；`CALM_STATES` 收编 sleepy（呼吸/眨眼生命层照常）；272 帧全合格，`git status app/frames` 仅新增两目录 |
+| DR-4 | 台词池 273 → 332：新态各 6 句 + 扩句 47（greet/sense/self/touch/needs/boss） | selftest | 台词 | — | **已落地**：selftest 9/9（48h 重复率判据 ≤15% 保持） |
+| DR-5 | 新态可达性无闸门：probe_audit 41 项不覆盖新态 | — | 闸门 | — | **已补**：新增 `tools/probe_r2_states.py`（帧数/cycle_seconds/台词可达/接线点/selftest TRIGGERED 五面共 9 项，全绿） |
+| DR-6 | **用户实测截图：sleepy 帧上雪花状噪点**（聊天窗口预览 `app/frames/sleepy/` 某帧，上半身区域 981 个孤立不透明小连通域；同批 surprised 0 个） | 帧连通域审计 + 逐级 bisect（cutout→trim→调色→fit 全干净，`animate()` 内 twist head 值 = **-7.5e16 度**） | 视觉 | 两段式：① 主因——sleepy 初版 `cycle_seconds: 4.5`/20 帧 → dt=0.225s，超出 `Spring(k=52,c=7.4)` 半隐式欧拉稳定边界（dt < c/k ≈ 0.142；全 14 态最大 dt），head 弹簧指数爆炸，`polar_twist` 拿天文数字角去扭采样坐标，双线性采样把整张 sprite 搅成雪花；② 次因——ImageGen 背景彩噪，`cutout` 的 flood fill 只认白底治不了 | **已修（两段都修）**：① `cycle_seconds/sleepy` 4.5→**3.2**（dt=0.16，落进实测稳定区，弹簧值回到 2.35°/2.6°）；② `qwen_poses.cutout()` 增加连通域剔除（min_area=2000，与 grok娘 drop_confetti 同思路），未来脏底图免疫。**闸门补强**：`build_motion` 新增 `_noise_components` 帧级噪点闸门（>20 连通域报红），焊进 `verify()` 与 `--check`——阈值 20 是给 dizzy 的"晕头星星"故意粒子（实测最多 15/帧）留的余量。全库 272 帧复验：最差 = dizzy 特效 15 ✓，sleepy 干净 |
+| DR-7 | **用户报告"她一直消失不见"**。取证：① 进程快照——哨兵 pythonw(24736, 18:04 启动) 在，pet 本体不在；② `run/quit` 存在（21:03:48，内容=`1791551028`）；③ save.json mtime=21:04:11 与内容 last_seen 精确一致 → 21:03:48 菜单退出后 21:04 左右还有一只 pet（应为双击 exe 拉起）存活过并落盘，之后也消失了且无日志；④ Qoder 19:10 起持续在跑、未换会话；⑤ err.log 无新 traceback（20:20 后零写入）→ **非崩溃** | 哨兵语义（sentinel.pyw:138 `elif not QUIT_FLAG.exists()`）：bound 模式下 `run/quit` 存在 = **本次 Qoder 会话不再拉起**；清除条件只有「Qoder 关过一轮 / 主窗口换进程」（sentinel.pyw:118-126）。quit 标记唯一 intent=True 写入入口 = 右键菜单「退出（本次 Qoder 期间不再自动回来）」（pet.pyw:1276→1349）。Qoder 一直开着 → 标记永不清除 → 她永远回不来；双击 exe 能短暂拉起（launcher 绕过标记、pet 本体不检查 quit），但第二只 pet 死因无日志可查 | 可用性（设计语义被触发 + launcher 可观测性缺失） | 哨兵轮询逻辑 + run/quit 生命周期 + launcher stderr 丢弃 | **已恢复**：删 `run/quit` → 哨兵 3 秒内自动拉起（pid 37340，21:17:02，err.log 无新异常）。**待办两件（不当场修）**：① launcher_qwen.py 的 Popen 未接 stderr——双击拉起的 pet 崩溃零痕迹，建议接 `run/pet.exe.log`（与哨兵路径同款防长满盘）；② 菜单文案/语义可议：intent 退出 = 整个 Qoder 会话消失，与用户直觉（"退出"=暂时不见）冲突，候选方案——quit 标记加 TTL（如 2h）或文案改为「退出（Qoder 重启前不再回来）」 |
+
+## AI 收尾（2026-10-11）
+
+- DAI-1：双击启动错误日志补齐，异常与 PID 可追溯，256KB 轮转；launcher 6/6。
+- DAI-2：退出文案写明恢复条件；保留会话抑制，不默认增加 TTL。DR-7 中曾以无日志判非崩溃，证据不足，该推断撤回；原现场记录保留。
+- DAI-3：静音时不再删除未显示信号；实际 14 态渲染与信号气泡 24/24；exe 4/4。
+- DAI-4：R2 14 态/272 帧/332 句回归，既有 R2 变更与本轮修复一起版本收口；口吻主观验收仍待用户。
+
+证据：`docs/validation-20261011/report.json`。

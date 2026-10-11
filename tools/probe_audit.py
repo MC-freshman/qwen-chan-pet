@@ -411,7 +411,7 @@ def test_standalone() -> None:
         return out
 
     bound, open_ = labels(True), labels(False)
-    check("J10 退出文案随模式变", "本次 Qoder 期间" in bound[-1] and "本次开机期间" in open_[-1],
+    check("J10 退出文案随模式变", "Qoder 关闭或重启前" in bound[-1] and "重启守护或电脑前" in open_[-1],
           "%r / %r" % (bound[-1], open_[-1]))
     check("J11 菜单项个数没变（refresh_menu 的 4/5/6 索引仍然对）",
           len(bound) == len(open_) and open_[4:7] == bound[4:7], str(open_[4:7]))

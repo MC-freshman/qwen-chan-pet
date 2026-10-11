@@ -1,0 +1,169 @@
+{
+  "date": "2026-10-11",
+  "project": "qwen娘",
+  "automated_only": true,
+  "human_acceptance": "pending: appearance, colors, voice style, interaction feel",
+  "gates": {
+    "selftest": {
+      "pass": true,
+      "checks": {
+        "no_unsatisfiable_lines": true,
+        "categories_present": true,
+        "at_least_150_lines": true,
+        "no_repeat_within_pool": true,
+        "decay_is_per_minute": true,
+        "offline_capped_at_12h": true,
+        "save_roundtrip": true,
+        "diary_written_nonempty": true,
+        "repeat_within_48h_le_15pct": true
+      },
+      "total_lines": 332
+    },
+    "launcher": {
+      "pass": true,
+      "checks": {
+        "child_failure_captured": true,
+        "child_stdout_captured": true,
+        "startup_pid_recorded": true,
+        "oversize_log_rotated": true,
+        "current_log_bounded": true,
+        "spawn_failure_captured": true
+      }
+    },
+    "behavior": {
+      "pass": true,
+      "checks": {
+        "window_visible": true,
+        "render_annoyed": true,
+        "render_dizzy": true,
+        "render_failed": true,
+        "render_idle": true,
+        "render_jumping": true,
+        "render_review": true,
+        "render_running": true,
+        "render_running-left": true,
+        "render_running-right": true,
+        "render_shy": true,
+        "render_sleepy": true,
+        "render_surprised": true,
+        "render_waiting": true,
+        "render_waving": true,
+        "busy_reaches_visible_bubble": true,
+        "same_kind_cooldown": true,
+        "qoder.done_reaches_visible_bubble": true,
+        "boss_reaches_visible_bubble": true,
+        "expired_ignored": true,
+        "muted_keeps_unspoken_signal": true,
+        "unmuted_consumes_signal": true,
+        "boss_title_reaches_visible_bubble": true,
+        "boss_title_cooldown": true
+      }
+    },
+    "r2_states": {
+      "pass": true,
+      "checks": {
+        "frames_surprised_20": true,
+        "frames_sleepy_20": true,
+        "cycle_seconds_surprised": true,
+        "cycle_seconds_sleepy": true,
+        "state_lines_surprised": true,
+        "state_lines_sleepy": true,
+        "wired_throw_surprised": true,
+        "wired_sleepy_states": true,
+        "selftest_triggered_updated": true
+      }
+    },
+    "transition": {
+      "pass": true,
+      "checks": {
+        "all_states_armed": true,
+        "softer_than_hard_cut": true
+      }
+    },
+    "q5": {
+      "pass": true,
+      "checks": {
+        "glance_ge_1_per_10min": true,
+        "stretch_ge_1_per_10min": true,
+        "weekly_first_plants_snapshot": true,
+        "weekly_file_written": true,
+        "weekly_delta_correct": true,
+        "stretch_visually_distinct": true
+      }
+    },
+    "exe": {
+      "pass": true,
+      "checks": {
+        "cold_start_visible_window": true,
+        "animation_changes_pixels": true,
+        "still_alive_after_warmup": true,
+        "second_launch_keeps_single_instance": true
+      },
+      "exe_sha256": "582603ce88c9566ac2cf570ff74844efd4392dab83f527f6546c182a9a8865c1",
+      "cold_start_seconds": 6.85
+    },
+    "closeout_gates": {
+      "pass": true,
+      "checks": {},
+      "runs": [
+        {
+          "command": [
+            "app/selftest.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.19
+        },
+        {
+          "command": [
+            "tools/probe_launcher.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.38
+        },
+        {
+          "command": [
+            "tools/probe_audit.py"
+          ],
+          "exit_code": 0,
+          "seconds": 1.66
+        },
+        {
+          "command": [
+            "build_motion.py",
+            "--check"
+          ],
+          "exit_code": 0,
+          "seconds": 6.31
+        },
+        {
+          "command": [
+            "tools/probe_transition.py"
+          ],
+          "exit_code": 0,
+          "seconds": 14.45
+        },
+        {
+          "command": [
+            "tools/probe_q5.py"
+          ],
+          "exit_code": 0,
+          "seconds": 2.05
+        },
+        {
+          "command": [
+            "tools/probe_r2_states.py"
+          ],
+          "exit_code": 0,
+          "seconds": 0.11
+        }
+      ]
+    },
+    "audit": {
+      "pass": true,
+      "passed_checks": 41
+    }
+  },
+  "source_digest": "98eeee89e4981ae29a1d43b2cc88570c2855eb327b14494407d7f168dad01fb1",
+  "source_files": 293,
+  "pass": true
+}

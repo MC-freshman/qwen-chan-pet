@@ -32,7 +32,9 @@
     "review": 3.2,
     "shy": 2.6,
     "annoyed": 3.2,
-    "dizzy": 1.6
+    "dizzy": 1.6,
+    "surprised": 1.6,
+    "sleepy": 3.2
   },
   "boss_window_keywords": [
     "bilibili",

@@ -44,7 +44,7 @@ FRAMES = {
     "running": 16,
     "review": 20,
 }
-CALM = {"idle", "waiting", "review", "failed"}
+CALM = {"idle", "waiting", "review", "failed", "sleepy"}
 HEAD_SECTOR = (-140.0, -40.0)   # image y grows down, so "up" is -90
 SKIRT_SECTOR = (40.0, 140.0)
 HIP_FRACTION = 0.66  # sway pivot, measured down the sprite
@@ -84,9 +84,20 @@ EXTRA_MOTION = {
         (0, 0, 0.0, 0.00), (3, 1, 5.0, -0.01), (5, 2, 8.0, -0.02), (3, 1, 5.0, -0.01),
         (0, 0, 0.0, 0.00), (-3, 1, -5.0, -0.01), (-5, 2, -8.0, -0.02), (-3, 1, -5.0, -0.01),
     ],
+    # 被甩出去那一瞬：先一缩，再向后上方弹开，左右各抖一下（起飞惊、落地晕，语义分开）
+    "surprised": [
+        (0, 0, 0.0, 0.02), (-1, -3, -2.0, -0.03), (-2, -5, -3.0, -0.04), (-1, -3, -2.0, -0.03),
+        (0, 0, 0.0, 0.02), (1, -2, 2.0, -0.02), (2, -4, 3.0, -0.03), (1, -2, 2.0, -0.02),
+    ],
+    # 打盹：极慢的点头 sway，配合 CALM 生命层呼吸
+    "sleepy": [
+        (0, 0, 0.0, 0.00), (0, 1, 1.5, 0.01), (1, 2, 2.5, 0.02), (1, 3, 3.0, 0.025),
+        (0, 2, 2.0, 0.015), (0, 0, 0.0, 0.00), (-1, 1, -1.5, 0.01), (-1, 2, -2.5, 0.015),
+    ],
 }
-EXTRA_FIT = {"shy": (172, 0), "annoyed": (170, 0), "dizzy": (172, 0)}
-EXTRA_FRAMES = {"shy": 20, "annoyed": 20, "dizzy": 20}
+EXTRA_FIT = {"shy": (172, 0), "annoyed": (170, 0), "dizzy": (172, 0),
+             "surprised": (170, 0), "sleepy": (170, 0)}
+EXTRA_FRAMES = {"shy": 20, "annoyed": 20, "dizzy": 20, "surprised": 20, "sleepy": 20}
 
 FIT.update({state: (height * S, bias * S) for state, (height, bias) in EXTRA_FIT.items()})
 MOTION.update({
@@ -378,6 +389,24 @@ def part_rig(sprite: Image.Image) -> dict:
     }
 
 
+def _noise_components(path: Path) -> int:
+    """R2 闸门：成品帧上孤立不透明小连通域的数量。
+
+    两个来源都会长成这样：AI 背景彩噪（cutout 治不到的），和弹簧数值爆炸后
+    polar_twist 把采样坐标搅乱产生的雪花（sleepy 初版 dt=0.225 炸过一次，
+    981 个噪点连通域）。干净帧实测 ≤2 个、≤2 像素；爆炸帧是几百个。
+    帧级阈值 20：dizzy 的"晕头星星"是故意画的 detached 粒子（实测最多 15 个/帧），
+    20 对两边都留足余量。"""
+    from scipy import ndimage
+
+    solid = np.array(Image.open(path).getchannel("A")) >= 128
+    lab, n = ndimage.label(solid)
+    if n <= 1:
+        return 0
+    sizes = ndimage.sum(solid, lab, range(1, n + 1))
+    return int((sizes < 3000).sum())
+
+
 def measure_shipped() -> int:
     """只测量、一个字节都不写：把 app/frames 里现有成品帧对着安全框读一遍。
 
@@ -396,6 +425,9 @@ def measure_shipped() -> int:
                 bad.append("空帧 " + str(path))
                 continue
             total += 1
+            noise = _noise_components(path)
+            if noise > 20:
+                bad.append("%s/%s 噪点连通域 %d（>20）" % (state, path.name, noise))
             worst["left"] = min(worst["left"], box[0])
             worst["top"] = min(worst["top"], box[1])
             worst["right"] = min(worst["right"], CELL_W - box[2])
@@ -519,6 +551,9 @@ def verify(states: list[str]) -> None:
             if box is None:
                 raise RuntimeError(f"empty frame {path}")
             left, top, right, bottom = box
+            noise = _noise_components(path)
+            if noise > 20:
+                violations.append(f"{path.name} of {state}: 噪点连通域 {noise}（>20）")
             if not fits(box):
                 violations.append(f"{path.name} of {state}: box={box}")
             clear["left"] = min(clear["left"], left)
